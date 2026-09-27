@@ -96,6 +96,10 @@
   .toast.show { opacity: 1; }
   .empty { color: var(--muted); font-size: 13.5px; padding: 20px 0; text-align: center; }
   a.link { color: var(--accent); }
+  .playerchip { padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border); background: var(--panel); cursor: pointer; font-size: 13px; }
+  .playerchip:hover { background: var(--accent-soft); }
+  .playercard-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .playercard-head h3 { margin: 0; text-transform: none; font-size: 17px; color: var(--text); }
 </style>
 </head>
 <body>
@@ -105,6 +109,7 @@
   <button class="navbtn" data-tab="load">Load Data</button>
   <button class="navbtn" data-tab="seasons">Seasons</button>
   <button class="navbtn" data-tab="rankings">Rankings</button>
+  <button class="navbtn" data-tab="players">Players</button>
   <button class="navbtn" data-tab="career">Career Chart</button>
   <button class="navbtn" data-tab="prospects">Prospects &amp; Leagues</button>
   <button class="navbtn" data-tab="backtest">Backtest</button>
@@ -171,9 +176,20 @@
     </details>
   </div>
   <div class="card">
+    <p id="calibrationNote" class="muted"></p>
     <div class="tablewrap"><table id="rankTable"><thead></thead><tbody></tbody></table></div>
     <p id="rankEmpty" class="empty">Load at least one season, then compute rankings.</p>
   </div>
+</section>
+
+<section id="tab-players" style="display:none">
+  <h2>Players</h2>
+  <p class="muted">Baseline stats as loaded from your CSVs, season by season - no model applied, just the raw record.</p>
+  <div class="card">
+    <input type="text" id="playerSearch" placeholder="Search a player name..." style="width:100%;max-width:340px" />
+    <div id="playerResults" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px"></div>
+  </div>
+  <div id="playerCard"></div>
 </section>
 
 <section id="tab-career" style="display:none">
@@ -474,6 +490,7 @@ document.querySelectorAll(".navbtn").forEach(btn => {
     document.getElementById("tab-"+btn.dataset.tab).style.display = "block";
     if (btn.dataset.tab === "seasons") renderSeasonsTab();
     if (btn.dataset.tab === "rankings") refreshSeasonDropdowns();
+    if (btn.dataset.tab === "players") renderPlayersTab();
     if (btn.dataset.tab === "prospects") renderProspectsTab();
     if (btn.dataset.tab === "backtest") refreshSeasonDropdowns();
   });
@@ -640,6 +657,37 @@ function parseAges() {
   return Object.keys(map).length ? map : null;
 }
 
+/* Fit pct_change ~ a + b*breakout_score across EVERY consecutive pair of
+   loaded seasons (not just the two picked in the dropdowns), pooling as
+   much history as exists so far. This is a rough linear calibration, not
+   a real projection model - see the note rendered alongside it. */
+async function computeCalibration(weights, minGp) {
+  const allRows = await dbGetAll("skaterRows");
+  const seasons = [...new Set(allRows.map(r=>r.season))].sort((a,b)=>a-b);
+  const pairs = [];
+  for (const s of seasons) {
+    const nextS = s + 1;
+    if (!seasons.includes(nextS)) continue;
+    const priorS = seasons.includes(s-1) ? s-1 : null;
+    const { rows: predicted } = await computeBreakoutScores(s, priorS, null, weights, minGp);
+    const baseline = {}, target = {};
+    allRows.filter(r=>r.situation==="all" && r.season===s).forEach(r=>baseline[r.name]={points:r.ind_points,gp:r.games_played});
+    allRows.filter(r=>r.situation==="all" && r.season===nextS).forEach(r=>target[r.name]={points:r.ind_points,gp:r.games_played});
+    predicted.forEach(p => {
+      const b = baseline[p.name], t = target[p.name];
+      if (!b || !t || b.gp < minGp || t.gp < minGp || b.points < 5) return;
+      pairs.push([p.breakout_score, (t.points - b.points) / b.points]);
+    });
+  }
+  if (pairs.length < 5) return { intercept: 0, slope: 0, n: pairs.length, usable: false };
+  const xs = pairs.map(p=>p[0]), ys = pairs.map(p=>p[1]);
+  const mx = xs.reduce((a,b)=>a+b,0)/xs.length, my = ys.reduce((a,b)=>a+b,0)/ys.length;
+  let cov=0, varx=0;
+  for (let i=0;i<xs.length;i++) { cov += (xs[i]-mx)*(ys[i]-my); varx += (xs[i]-mx)**2; }
+  const slope = varx===0 ? 0 : cov/varx;
+  return { intercept: my - slope*mx, slope, n: pairs.length, usable: true };
+}
+
 let lastRankResults = null;
 document.getElementById("rankBtn").addEventListener("click", async () => {
   const currentSeason = document.getElementById("rankCurrent").value;
@@ -647,11 +695,33 @@ document.getElementById("rankBtn").addEventListener("click", async () => {
   if (!currentSeason) { toast("Load a season first"); return; }
   const ages = parseAges();
   const minGp = Number(document.getElementById("rankMinGp").value) || 0;
-  const { rows, activeWeights } = await computeBreakoutScores(currentSeason, priorSeason, ages, currentWeights(), minGp);
+  const weights = currentWeights();
+  const { rows, activeWeights } = await computeBreakoutScores(currentSeason, priorSeason, ages, weights, minGp);
+
+  const calib = await computeCalibration(weights, minGp);
+  const note = document.getElementById("calibrationNote");
+  if (calib.usable) {
+    const allRows = await dbGetAll("skaterRows");
+    const baselineMap = {};
+    allRows.filter(r=>r.situation==="all" && r.season===Number(currentSeason))
+      .forEach(r => baselineMap[r.name] = r.ind_points);
+    rows.forEach(r => {
+      const base = baselineMap[r.name];
+      r.expected_pts_next = (base != null)
+        ? Math.max(0, base * (1 + calib.intercept + calib.slope * r.breakout_score))
+        : null;
+    });
+    note.textContent = `Expected next-season points calibrated from ${calib.n} player-season transitions across your loaded seasons. `+
+      (calib.n < 50 ? "That's a small sample - treat these numbers as rough, not precise." : "");
+  } else {
+    rows.forEach(r => r.expected_pts_next = null);
+    note.textContent = "Not enough season-to-season history to calibrate expected points yet - load at least two consecutive seasons.";
+  }
+
   lastRankResults = rows;
   const table = document.getElementById("rankTable");
-  const cols = ["model_rank","name","position","games_played","luck_gap","shots60","pp_trend","gp_bonus","breakout_score"];
-  table.querySelector("thead").innerHTML = "<tr>" + cols.map(c=>`<th>${c.replace("_"," ")}</th>`).join("") + "</tr>";
+  const cols = ["model_rank","name","position","games_played","luck_gap","shots60","pp_trend","gp_bonus","breakout_score","expected_pts_next"];
+  table.querySelector("thead").innerHTML = "<tr>" + cols.map(c=>`<th>${c.replace(/_/g," ")}</th>`).join("") + "</tr>";
   table.querySelector("tbody").innerHTML = rows.map(r => "<tr>" + cols.map(c => {
     let v = r[c];
     if (typeof v === "number") v = Math.round(v*1000)/1000;
@@ -664,7 +734,7 @@ document.getElementById("rankBtn").addEventListener("click", async () => {
 
 document.getElementById("rankExportBtn").addEventListener("click", async () => {
   if (!lastRankResults) { toast("Compute rankings first"); return; }
-  const cols = ["model_rank","name","position","games_played","luck_gap","shots60","pp_trend","gp_bonus","breakout_score"];
+  const cols = ["model_rank","name","position","games_played","luck_gap","shots60","pp_trend","gp_bonus","breakout_score","expected_pts_next"];
   const csv = [cols.join(",")].concat(lastRankResults.map(r => cols.map(c=>r[c]).join(","))).join("\n");
   await exportCSV("breakout_rankings.csv", csv);
 });
@@ -739,6 +809,46 @@ document.getElementById("addProspectBtn").addEventListener("click", async () => 
   toast("Prospect row added");
 });
 async function renderProspectsTab() { await renderLeaguesTable(); await renderProspectTable(); }
+
+/* --- Players tab --- */
+async function renderPlayersTab() { document.getElementById("playerSearch").focus(); }
+document.getElementById("playerSearch").addEventListener("input", async (e) => {
+  const q = e.target.value.trim().toLowerCase();
+  const resultsDiv = document.getElementById("playerResults");
+  if (!q) { resultsDiv.innerHTML = ""; return; }
+  const allRows = await dbGetAll("skaterRows");
+  const names = [...new Set(allRows.map(r=>r.name))].filter(n=>n.toLowerCase().includes(q)).sort();
+  resultsDiv.innerHTML = names.slice(0, 40).map(n =>
+    `<button class="playerchip" data-name="${n.replace(/"/g,"&quot;")}">${n}</button>`).join("") ||
+    '<span class="muted">No matches.</span>';
+  resultsDiv.querySelectorAll("button[data-name]").forEach(btn => {
+    btn.addEventListener("click", () => showPlayerCard(btn.dataset.name));
+  });
+});
+async function showPlayerCard(name) {
+  const allRows = await dbGetAll("skaterRows");
+  const seasons = allRows.filter(r => r.name === name && r.situation === "all").sort((a,b)=>a.season-b.season);
+  const positions = [...new Set(seasons.map(r=>r.position))].join("/");
+  const careerGp = seasons.reduce((a,r)=>a+(r.games_played||0), 0);
+  const careerPts = seasons.reduce((a,r)=>a+(r.ind_points||0), 0);
+  const rowsHtml = seasons.map(r => {
+    const ppg = r.games_played ? (r.ind_points / r.games_played).toFixed(2) : "-";
+    return `<tr><td>${r.season}</td><td>${r.team||""}</td><td>${r.position||""}</td><td>${r.games_played}</td><td>${r.ind_goals}</td><td>${r.ind_points}</td><td>${ppg}</td></tr>`;
+  }).join("");
+  document.getElementById("playerCard").innerHTML = `
+    <div class="card">
+      <div class="playercard-head"><h3>${name}</h3><span class="pill">${positions}</span></div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="num">${seasons.length}</div><div class="lbl">Seasons loaded</div></div>
+        <div class="stat-box"><div class="num">${careerGp}</div><div class="lbl">Career GP (loaded)</div></div>
+        <div class="stat-box"><div class="num">${careerPts}</div><div class="lbl">Career points (loaded)</div></div>
+      </div>
+      <div class="tablewrap">
+        <table><thead><tr><th>Season</th><th>Team</th><th>Pos</th><th>GP</th><th>G</th><th>PTS</th><th>PPG</th></tr></thead>
+        <tbody>${rowsHtml || '<tr><td colspan="7" class="empty">No season-total rows found for this player.</td></tr>'}</tbody></table>
+      </div>
+    </div>`;
+}
 
 /* --- Career chart --- */
 let careerChart = null;
