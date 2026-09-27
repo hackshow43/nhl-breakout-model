@@ -112,12 +112,11 @@
 
 <nav id="nav">
   <h1>🏒 Breakout Model</h1>
-  <button class="navbtn" data-tab="rankings">Rankings</button>
+  <button class="navbtn" data-tab="rankings">Rankings &amp; Backtest</button>
   <button class="navbtn" data-tab="leaders">Stat Leaders</button>
   <button class="navbtn" data-tab="players">Players</button>
   <button class="navbtn" data-tab="career">Career Chart</button>
   <button class="navbtn" data-tab="prospects">Prospects &amp; Leagues</button>
-  <button class="navbtn" data-tab="backtest">Backtest</button>
   <button class="navbtn" data-tab="data">Load Data</button>
 </nav>
 
@@ -189,6 +188,25 @@
     <div class="tablewrap"><table id="rankTable"><thead></thead><tbody></tbody></table></div>
     <p id="rankEmpty" class="empty">Load at least one season, then compute rankings.</p>
   </div>
+
+  <h2 style="margin-top:28px">Backtest</h2>
+  <p class="muted">Score players using only what would have been known before a target season, then check those predictions against what actually happened.</p>
+  <div class="card">
+    <div class="row">
+      <div><label>Predict FROM season</label><select id="btCurrent"></select></div>
+      <div><label>Prior season (PP trend)</label><select id="btPrior"><option value="">None</option></select></div>
+      <div><label>Actual outcome season</label><select id="btActual"></select></div>
+      <div><label>Min GP (both seasons)</label><input type="number" id="btMinGp" value="30" style="width:80px" /></div>
+      <div><label>Growth threshold</label><input type="number" step="0.05" id="btGrowth" value="0.20" style="width:80px" /></div>
+      <div><label>Top K</label><input type="number" id="btTopK" value="10" style="width:70px" /></div>
+      <button class="btn" id="btBtn">Run Backtest</button>
+    </div>
+  </div>
+  <div class="card" id="btResults" style="display:none">
+    <div class="stat-grid" id="btStats"></div>
+    <div class="tablewrap"><table id="btTable"><thead></thead><tbody></tbody></table></div>
+  </div>
+  <p id="btEmpty" class="empty">Run a backtest to see results.</p>
 </section>
 
 <section id="tab-leaders" style="display:none">
@@ -267,26 +285,6 @@
   </div>
 </section>
 
-<section id="tab-backtest" style="display:none">
-  <h2>Backtest</h2>
-  <p class="muted">Score players using only what would have been known before a target season, then check those predictions against what actually happened.</p>
-  <div class="card">
-    <div class="row">
-      <div><label>Predict FROM season</label><select id="btCurrent"></select></div>
-      <div><label>Prior season (PP trend)</label><select id="btPrior"><option value="">None</option></select></div>
-      <div><label>Actual outcome season</label><select id="btActual"></select></div>
-      <div><label>Min GP (both seasons)</label><input type="number" id="btMinGp" value="30" style="width:80px" /></div>
-      <div><label>Growth threshold</label><input type="number" step="0.05" id="btGrowth" value="0.20" style="width:80px" /></div>
-      <div><label>Top K</label><input type="number" id="btTopK" value="10" style="width:70px" /></div>
-      <button class="btn" id="btBtn">Run Backtest</button>
-    </div>
-  </div>
-  <div class="card" id="btResults" style="display:none">
-    <div class="stat-grid" id="btStats"></div>
-    <div class="tablewrap"><table id="btTable"><thead></thead><tbody></tbody></table></div>
-  </div>
-  <p id="btEmpty" class="empty">Run a backtest to see results.</p>
-</section>
 
 </main>
 <div class="toast" id="toast"></div>
