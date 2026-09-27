@@ -1116,7 +1116,7 @@ async function loadLeadersData() {
       return { ...r, assists: stats.assists, ppg: r.games_played ? r.ind_points/r.games_played : 0,
                 luck: r.ind_goals - r.ind_xgoals,
                 sh_pct: r.ind_shots_on_goal ? (r.ind_goals / r.ind_shots_on_goal * 100) : null,
-                plus_minus: stats.plus_minus, pim: stats.pim, ppp: stats.ppp,
+                plus_minus: stats.plus_minus, pim: stats.pim, ppp: stats.ppp, sog: stats.sog,
                 hits: stats.hits, blocks: stats.blocks, fantasy_pts };
     });
 
