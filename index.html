@@ -118,6 +118,7 @@
   <button class="navbtn" data-tab="career">Career Chart</button>
   <button class="navbtn" data-tab="prospects">Prospects &amp; Leagues</button>
   <button class="navbtn" data-tab="data">Load Data</button>
+  <button class="navbtn" data-tab="settings">Settings</button>
 </nav>
 
 <main>
@@ -286,12 +287,39 @@
 </section>
 
 
+<section id="tab-settings" style="display:none">
+  <h2>Settings</h2>
+  <div class="card">
+    <label style="display:flex;align-items:center;gap:8px;font-size:14px;color:var(--text);cursor:pointer">
+      <input type="checkbox" id="fantasyModeToggle" style="width:16px;height:16px" />
+      Fantasy Mode &mdash; show Fantasy Pts / Fantasy Rank on Stat Leaders and Player Cards
+    </label>
+  </div>
+
+  <h3>Skater fantasy scoring</h3>
+  <p class="muted">Points per unit of each stat. Values can be negative - e.g. a negative PIM value penalizes penalty minutes instead of rewarding them. Uncheck a category to leave it out of the total entirely.</p>
+  <div class="card">
+    <div class="tablewrap"><table id="fantasySkaterTable"><thead><tr><th></th><th>Category</th><th>Points per unit</th></tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <h3>Goalie fantasy scoring</h3>
+  <p class="muted">Configurable now, but inert until goalie data loading is added - these categories won't do anything yet. GP, GAA, GSAx and SV% will show on a future goalie card as descriptive stats, but are intentionally not fantasy-scored here.</p>
+  <div class="card">
+    <div class="tablewrap"><table id="fantasyGoalieTable"><thead><tr><th></th><th>Category</th><th>Points per unit</th></tr></thead><tbody></tbody></table></div>
+  </div>
+
+  <div class="row" style="margin-top:6px">
+    <button class="btn" id="fantasySaveBtn">Save Fantasy Settings</button>
+    <button class="btn secondary" id="fantasyResetBtn">Reset to defaults</button>
+  </div>
+</section>
+
 </main>
 <div class="toast" id="toast"></div>
 
 <script>
 /* ======================= IndexedDB layer ======================= */
-const DB_NAME = "nhlBreakoutDB", DB_VERSION = 1;
+const DB_NAME = "nhlBreakoutDB", DB_VERSION = 2;
 let dbPromise = null;
 function openDB() {
   if (dbPromise) return dbPromise;
@@ -312,11 +340,28 @@ function openDB() {
       if (!db.objectStoreNames.contains("leagues")) {
         db.createObjectStore("leagues", { keyPath: "league_code" });
       }
+      if (!db.objectStoreNames.contains("settings")) {
+        db.createObjectStore("settings", { keyPath: "key" });
+      }
     };
     req.onsuccess = (e) => resolve(e.target.result);
     req.onerror = (e) => reject(e);
   });
   return dbPromise;
+}
+async function dbGetSetting(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction("settings", "readonly").objectStore("settings").get(key);
+    req.onsuccess = () => resolve(req.result ? req.result.value : null);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbSetSetting(key, value) {
+  const db = await openDB();
+  const tx = db.transaction("settings", "readwrite");
+  tx.objectStore("settings").put({ key, value });
+  await txDone(tx);
 }
 function txDone(tx) { return new Promise((res, rej) => { tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); }); }
 async function dbGetAll(store) {
@@ -428,6 +473,68 @@ function gpThresholdBonus(gp, group) {
 }
 const DEFAULT_WEIGHTS = { luck_gap: 0.30, pp_trend: 0.25, age_curve: 0.20, gp_threshold: 0.15, shot_volume: 0.10 };
 
+/* ======================= Fantasy scoring config ======================= */
+// Each category maps to a stat key produced by getPlayerFantasyStats() below.
+// Values are points per unit of that stat and are free to be negative -
+// e.g. PIM at -0.2 would penalize penalty minutes instead of rewarding them.
+const DEFAULT_FANTASY_SKATER_CATEGORIES = [
+  { key: "G",   label: "Goals",            statKey: "goals",      value: 3.4, enabled: true },
+  { key: "A",   label: "Assists",          statKey: "assists",    value: 1.7, enabled: true },
+  { key: "PM",  label: "+/-",              statKey: "plus_minus", value: 0.5, enabled: true },
+  { key: "PIM", label: "PIM",              statKey: "pim",        value: 0.1, enabled: true },
+  { key: "PPP", label: "PPP",              statKey: "ppp",        value: 0.5, enabled: true },
+  { key: "SOG", label: "Shots on goal",    statKey: "sog",        value: 0.2, enabled: true },
+  { key: "HIT", label: "Hits",             statKey: "hits",       value: 0.2, enabled: true },
+  { key: "BLK", label: "Blocks",           statKey: "blocks",     value: 0.2, enabled: true },
+];
+// Goalie categories - configurable now, but inert until goalie data loading
+// exists. GP/GAA/GSAx/SV% are intentionally NOT here - those are descriptive
+// rate stats for a future goalie card, not fantasy-scored counting stats.
+const DEFAULT_FANTASY_GOALIE_CATEGORIES = [
+  { key: "W",  label: "Wins",           statKey: "wins",   value: 5,    enabled: true },
+  { key: "GA", label: "Goals allowed",  statKey: "ga",     value: -1,   enabled: true },
+  { key: "SV", label: "Saves",          statKey: "saves",  value: 0.2,  enabled: true },
+  { key: "SO", label: "Shutouts",       statKey: "so",     value: 3,    enabled: true },
+];
+
+let fantasyConfig = null; // loaded async at init, see loadFantasyConfig()
+function defaultFantasyConfig() {
+  return { enabled: false, skater: DEFAULT_FANTASY_SKATER_CATEGORIES.map(c=>({...c})),
+           goalie: DEFAULT_FANTASY_GOALIE_CATEGORIES.map(c=>({...c})) };
+}
+async function loadFantasyConfig() {
+  const saved = await dbGetSetting("fantasyConfig");
+  fantasyConfig = saved || defaultFantasyConfig();
+  return fantasyConfig;
+}
+async function saveFantasyConfig(cfg) {
+  fantasyConfig = cfg;
+  await dbSetSetting("fantasyConfig", cfg);
+}
+function computeFantasyPoints(stats, categories) {
+  return categories.filter(c=>c.enabled).reduce((sum,c) => sum + (Number(c.value)||0) * (stats[c.statKey] || 0), 0);
+}
+/* Pull the skater fantasy stat set for one player+season from already-loaded
+   skater rows: G/A/PTS/SOG/HIT/BLK/PIM from the 'all' situation row,
+   +/- from the 5on5-only on-ice goals for/against (traditional definition -
+   even strength only), PPP from the 5on4 (power play) situation row. */
+function getPlayerFantasyStats(allRows, name, season) {
+  const all5 = allRows.find(r => r.name===name && r.season===season && r.situation==="all");
+  const on5v5 = allRows.find(r => r.name===name && r.season===season && r.situation==="5on5");
+  const on5v4 = allRows.find(r => r.name===name && r.season===season && r.situation==="5on4");
+  if (!all5) return null;
+  return {
+    goals: all5.ind_goals || 0,
+    assists: (all5.ind_points||0) - (all5.ind_goals||0),
+    plus_minus: on5v5 ? (on5v5.onice_goals||0) - (on5v5.onice_against_goals||0) : 0,
+    pim: all5.ind_pim || 0,
+    ppp: on5v4 ? (on5v4.ind_points||0) : 0,
+    sog: all5.ind_shots_on_goal || 0,
+    hits: all5.ind_hits || 0,
+    blocks: all5.ind_blocks || 0,
+  };
+}
+
 async function computeBreakoutScores(currentSeason, priorSeason, agesMap, weights, minGp) {
   const currentRows = await dbGetBySeason("skaterRows", Number(currentSeason));
   let ev = currentRows.filter(r => r.situation === "5on5");
@@ -523,10 +630,56 @@ document.querySelectorAll(".navbtn").forEach(btn => {
     if (btn.dataset.tab === "players") renderPlayersTab();
     if (btn.dataset.tab === "career") renderCareerSelected();
     if (btn.dataset.tab === "prospects") renderProspectsTab();
+    if (btn.dataset.tab === "settings") renderSettingsTab();
     if (btn.dataset.tab === "backtest") refreshSeasonDropdowns();
   });
 });
 document.querySelector('.navbtn[data-tab="rankings"]').classList.add("active");
+
+/* --- Settings tab --- */
+function renderFantasyCategoryTable(tableId, categories) {
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  tbody.innerHTML = categories.map((c,i) => `<tr>
+    <td><input type="checkbox" data-idx="${i}" class="cat-enabled" ${c.enabled?"checked":""} /></td>
+    <td>${c.label}</td>
+    <td><input type="number" step="0.1" data-idx="${i}" class="cat-value" value="${c.value}" style="width:100px" /></td>
+  </tr>`).join("");
+}
+function readCategoryTable(tableId, originalCategories) {
+  const rows = document.querySelectorAll(`#${tableId} tbody tr`);
+  return originalCategories.map((c,i) => ({ ...c,
+    enabled: rows[i].querySelector(".cat-enabled").checked,
+    value: Number(rows[i].querySelector(".cat-value").value) || 0 }));
+}
+async function renderSettingsTab() {
+  await loadFantasyConfig();
+  document.getElementById("fantasyModeToggle").checked = fantasyConfig.enabled;
+  renderFantasyCategoryTable("fantasySkaterTable", fantasyConfig.skater);
+  renderFantasyCategoryTable("fantasyGoalieTable", fantasyConfig.goalie);
+}
+document.getElementById("fantasyModeToggle").addEventListener("change", async (e) => {
+  await loadFantasyConfig();
+  fantasyConfig.enabled = e.target.checked;
+  await saveFantasyConfig(fantasyConfig);
+  if (leadersRawData.length) applyLeaderFilters();
+});
+document.getElementById("fantasySaveBtn").addEventListener("click", async () => {
+  const cfg = {
+    enabled: document.getElementById("fantasyModeToggle").checked,
+    skater: readCategoryTable("fantasySkaterTable", fantasyConfig.skater),
+    goalie: readCategoryTable("fantasyGoalieTable", fantasyConfig.goalie),
+  };
+  await saveFantasyConfig(cfg);
+  toast("Fantasy settings saved");
+  if (leadersRawData.length) applyLeaderFilters();
+});
+document.getElementById("fantasyResetBtn").addEventListener("click", async () => {
+  const cfg = defaultFantasyConfig();
+  cfg.enabled = document.getElementById("fantasyModeToggle").checked;
+  await saveFantasyConfig(cfg);
+  renderSettingsTab();
+  toast("Reset to default fantasy values");
+});
 
 /* --- Load tab --- */
 let pendingFile = null;
@@ -558,7 +711,11 @@ document.getElementById("loadBtn").addEventListener("click", () => {
         ind_shot_attempts: findCol(headers, ["I_F_shotAttempts","iCF","Corsi"]),
         ind_shots_on_goal: findCol(headers, ["I_F_shotsOnGoal"]),
         onice_goals: findCol(headers, ["OnIce_F_goals","onIce_goals"]),
-        onice_shots_on_goal: findCol(headers, ["OnIce_F_shotsOnGoal","onIce_shotsOnGoal"])
+        onice_shots_on_goal: findCol(headers, ["OnIce_F_shotsOnGoal","onIce_shotsOnGoal"]),
+        onice_against_goals: findCol(headers, ["OnIce_A_goals","onIce_A_goals"]),
+        ind_hits: findCol(headers, ["I_F_hits","hits","HIT"]),
+        ind_blocks: findCol(headers, ["shotsBlockedByPlayer","blocked_shots","BLK"]),
+        ind_pim: findCol(headers, ["I_F_penalityMinutes","penalityMinutes","PIM"])
       };
       const idCol = findCol(headers, ["playerId","player_id","ID"]);
       const missing = Object.entries(colmap).filter(([k,v]) => v===null && k!=="team").map(([k])=>k);
@@ -599,7 +756,9 @@ document.getElementById("loadBtn").addEventListener("click", () => {
         ind_goals: num(r[colmap.ind_goals]), ind_points: num(r[colmap.ind_points]),
         ind_xgoals: num(r[colmap.ind_xgoals]), ind_shot_attempts: num(r[colmap.ind_shot_attempts]),
         ind_shots_on_goal: num(r[colmap.ind_shots_on_goal]),
-        onice_goals: num(r[colmap.onice_goals]), onice_shots_on_goal: num(r[colmap.onice_shots_on_goal])
+        onice_goals: num(r[colmap.onice_goals]), onice_shots_on_goal: num(r[colmap.onice_shots_on_goal]),
+        onice_against_goals: num(r[colmap.onice_against_goals]),
+        ind_hits: num(r[colmap.ind_hits]), ind_blocks: num(r[colmap.ind_blocks]), ind_pim: num(r[colmap.ind_pim])
       })).filter(r => r.name);
       const collisions = Object.entries(nameToIds).filter(([,ids])=>ids.size>1).map(([n])=>n);
       if (collisions.length) toast(`Note: disambiguated ${collisions.length} same-name collision(s)`);
@@ -902,13 +1061,19 @@ document.getElementById("addProspectBtn").addEventListener("click", async () => 
 async function renderProspectsTab() { await renderLeaguesTable(); await renderProspectTable(); }
 
 /* --- Stat Leaders tab --- */
-const LEADER_COLUMNS = [
+const LEADER_BASE_COLUMNS = [
   { key:"name", label:"Name", isName:true },
   { key:"team", label:"Team" },
   { key:"position", label:"Pos" },
   { key:"games_played", label:"GP" },
   { key:"ind_goals", label:"G" },
   { key:"assists", label:"A" },
+  { key:"plus_minus", label:"+/-" },
+  { key:"pim", label:"PIM" },
+  { key:"ppp", label:"PPP" },
+  { key:"sog", label:"SOG" },
+  { key:"hits", label:"HIT" },
+  { key:"blocks", label:"BLK" },
   { key:"ind_points", label:"PTS" },
   { key:"ppg", label:"PPG", decimals: 2 },
   { key:"ind_xgoals", label:"xG", decimals: 1 },
@@ -916,20 +1081,50 @@ const LEADER_COLUMNS = [
   { key:"sh_pct", label:"Sh%", decimals: 1 },
   { key:"ind_shot_attempts", label:"Shot Att" },
 ];
+const LEADER_FANTASY_COLUMNS = [
+  { key:"fantasy_pts", label:"Fantasy Pts", decimals: 1 },
+  { key:"fantasy_rank", label:"Fantasy Rank" },
+];
+function getLeaderColumns() {
+  return (fantasyConfig && fantasyConfig.enabled) ? [...LEADER_BASE_COLUMNS, ...LEADER_FANTASY_COLUMNS] : LEADER_BASE_COLUMNS;
+}
 let leadersRawData = [];
 let leadersData = [];
 let leadersSort = { key: "ind_points", dir: -1 };
 
 async function loadLeadersData() {
+  if (!fantasyConfig) await loadFantasyConfig();
   const seasonSel = document.getElementById("leadersSeason");
   const season = Number(seasonSel.value);
   const minGp = Number(document.getElementById("leadersMinGp").value) || 0;
   if (!season) { leadersRawData = []; leadersData = []; renderLeadersTable(); return; }
   const allRows = await dbGetAll("skaterRows");
+  const on5v5Map = {}, on5v4Map = {};
+  allRows.filter(r=>r.season===season && r.situation==="5on5").forEach(r=>on5v5Map[r.name]=r);
+  allRows.filter(r=>r.season===season && r.situation==="5on4").forEach(r=>on5v4Map[r.name]=r);
+
   leadersRawData = allRows.filter(r => r.season===season && r.situation==="all" && r.games_played>=minGp)
-    .map(r => ({ ...r, assists: r.ind_points - r.ind_goals, ppg: r.games_played ? r.ind_points/r.games_played : 0,
-                 luck: r.ind_goals - r.ind_xgoals,
-                 sh_pct: r.ind_shots_on_goal ? (r.ind_goals / r.ind_shots_on_goal * 100) : null }));
+    .map(r => {
+      const s5 = on5v5Map[r.name], s4 = on5v4Map[r.name];
+      const stats = {
+        goals: r.ind_goals || 0, assists: (r.ind_points||0) - (r.ind_goals||0),
+        plus_minus: s5 ? (s5.onice_goals||0) - (s5.onice_against_goals||0) : 0,
+        pim: r.ind_pim || 0, ppp: s4 ? (s4.ind_points||0) : 0,
+        sog: r.ind_shots_on_goal || 0, hits: r.ind_hits || 0, blocks: r.ind_blocks || 0,
+      };
+      const fantasy_pts = computeFantasyPoints(stats, fantasyConfig.skater);
+      return { ...r, assists: stats.assists, ppg: r.games_played ? r.ind_points/r.games_played : 0,
+                luck: r.ind_goals - r.ind_xgoals,
+                sh_pct: r.ind_shots_on_goal ? (r.ind_goals / r.ind_shots_on_goal * 100) : null,
+                plus_minus: stats.plus_minus, pim: stats.pim, ppp: stats.ppp,
+                hits: stats.hits, blocks: stats.blocks, fantasy_pts };
+    });
+
+  // Fantasy rank is computed on the whole min-GP-filtered season, independent
+  // of the team/position filters below, so it reads as an overall rank.
+  const byFantasy = [...leadersRawData].sort((a,b) => b.fantasy_pts - a.fantasy_pts);
+  const rankMap = {}; byFantasy.forEach((r,i) => rankMap[r.name] = i+1);
+  leadersRawData.forEach(r => r.fantasy_rank = rankMap[r.name]);
 
   const teamSel = document.getElementById("leadersTeam"), posSel = document.getElementById("leadersPosition");
   const curTeam = teamSel.value, curPos = posSel.value;
@@ -972,12 +1167,13 @@ function renderLeadersTable() {
     return;
   }
   empty.style.display = "none";
+  const cols = getLeaderColumns();
   const sorted = [...leadersData].sort((a,b) => compareLeaderVals(a, b, leadersSort.key, leadersSort.dir));
-  table.innerHTML = "<thead><tr>" + LEADER_COLUMNS.map(c => {
+  table.innerHTML = "<thead><tr>" + cols.map(c => {
     const active = c.key === leadersSort.key;
     const arrow = active ? (leadersSort.dir === 1 ? " \u25B2" : " \u25BC") : "";
     return `<th data-sort="${c.key}" style="cursor:pointer">${c.label}${arrow}</th>`;
-  }).join("") + "</tr></thead><tbody>" + sorted.map(r => "<tr>" + LEADER_COLUMNS.map(c => {
+  }).join("") + "</tr></thead><tbody>" + sorted.map(r => "<tr>" + cols.map(c => {
     let v = r[c.key];
     if (typeof v === "number") v = c.decimals != null ? v.toFixed(c.decimals) : Math.round(v);
     if (c.isName) return `<td><span class="score-toggle" data-player="${String(v).replace(/"/g,"&quot;")}">${v}</span></td>`;
@@ -1024,15 +1220,26 @@ document.getElementById("playerSearch").addEventListener("input", async (e) => {
   });
 });
 async function showPlayerCard(name) {
+  if (!fantasyConfig) await loadFantasyConfig();
   const allRows = await dbGetAll("skaterRows");
   const seasons = allRows.filter(r => r.name === name && r.situation === "all").sort((a,b)=>a.season-b.season);
   const positions = [...new Set(seasons.map(r=>r.position))].join("/");
   const careerGp = seasons.reduce((a,r)=>a+(r.games_played||0), 0);
   const careerPts = seasons.reduce((a,r)=>a+(r.ind_points||0), 0);
+
+  let careerFantasy = 0;
   const rowsHtml = seasons.map(r => {
     const ppg = r.games_played ? (r.ind_points / r.games_played).toFixed(2) : "-";
-    return `<tr><td>${r.season}</td><td>${r.team||""}</td><td>${r.position||""}</td><td>${r.games_played}</td><td>${r.ind_goals}</td><td>${r.ind_points}</td><td>${ppg}</td></tr>`;
+    const stats = getPlayerFantasyStats(allRows, name, r.season) || {};
+    const fp = computeFantasyPoints(stats, fantasyConfig.skater);
+    careerFantasy += fp;
+    const fantasyCell = fantasyConfig.enabled ? `<td>${fp.toFixed(1)}</td>` : "";
+    return `<tr><td>${r.season}</td><td>${r.team||""}</td><td>${r.position||""}</td><td>${r.games_played}</td>` +
+      `<td>${stats.goals ?? r.ind_goals}</td><td>${stats.assists ?? ""}</td><td>${r.ind_points}</td><td>${ppg}</td>` +
+      `<td>${stats.plus_minus ?? ""}</td><td>${stats.pim ?? ""}</td><td>${stats.ppp ?? ""}</td>` +
+      `<td>${stats.sog ?? ""}</td><td>${stats.hits ?? ""}</td><td>${stats.blocks ?? ""}</td>${fantasyCell}</tr>`;
   }).join("");
+  const fantasyHeaderCell = fantasyConfig.enabled ? "<th>Fantasy</th>" : "";
 
   // Breakout score for their most recently loaded season, computed on the
   // fly (min-GP floor of 0 here, since this is a single-player lookup, not
@@ -1049,6 +1256,9 @@ async function showPlayerCard(name) {
         `<div class="lbl">Breakout score (${latestSeason}, rank ${idx+1}/${scored.length})</div></div>`;
     }
   }
+  const fantasyStatBox = fantasyConfig.enabled
+    ? `<div class="stat-box"><div class="num">${careerFantasy.toFixed(1)}</div><div class="lbl">Career fantasy pts (loaded)</div></div>`
+    : "";
 
   document.getElementById("playerCard").innerHTML = `
     <div class="card">
@@ -1057,11 +1267,13 @@ async function showPlayerCard(name) {
         <div class="stat-box"><div class="num">${seasons.length}</div><div class="lbl">Seasons loaded</div></div>
         <div class="stat-box"><div class="num">${careerGp}</div><div class="lbl">Career GP (loaded)</div></div>
         <div class="stat-box"><div class="num">${careerPts}</div><div class="lbl">Career points (loaded)</div></div>
+        ${fantasyStatBox}
         ${scoreHtml}
       </div>
       <div class="tablewrap">
-        <table><thead><tr><th>Season</th><th>Team</th><th>Pos</th><th>GP</th><th>G</th><th>PTS</th><th>PPG</th></tr></thead>
-        <tbody>${rowsHtml || '<tr><td colspan="7" class="empty">No season-total rows found for this player.</td></tr>'}</tbody></table>
+        <table><thead><tr><th>Season</th><th>Team</th><th>Pos</th><th>GP</th><th>G</th><th>A</th><th>PTS</th><th>PPG</th>
+          <th>+/-</th><th>PIM</th><th>PPP</th><th>SOG</th><th>HIT</th><th>BLK</th>${fantasyHeaderCell}</tr></thead>
+        <tbody>${rowsHtml || '<tr><td colspan="15" class="empty">No season-total rows found for this player.</td></tr>'}</tbody></table>
       </div>
       <h3 style="margin-top:18px">Career trajectory</h3>
       <canvas id="playerCardChart" height="90"></canvas>
@@ -1301,6 +1513,7 @@ document.getElementById("btBtn").addEventListener("click", async () => {
 /* --- init --- */
 seedLeaguesIfEmpty();
 refreshSeasonDropdowns();
+loadFantasyConfig();
 </script>
 </body>
 </html>
