@@ -125,14 +125,15 @@
 
 <section id="tab-data" style="display:none">
   <h2>Load Season Data</h2>
-  <p class="muted">Upload a MoneyPuck-style CSV (situation-level: rows for 5on5, 5on4, all, etc.) and tag it with a season number. Re-loading a season replaces its existing rows of that type.</p>
+  <p class="muted">Upload a MoneyPuck-style CSV (situation-level: rows for 5on5, 5on4, all, etc.) and tag it with a season number. Re-loading a season replaces its existing rows of that type. "Goalie Decisions" is different - it's a Hockey-Reference export (W/L/OT/GS/SO/G/A/PIM) that <em>merges</em> into whatever goalie data you've already loaded for that season, rather than replacing it.</p>
   <div class="card">
     <div class="row">
       <div>
         <label>Data type</label>
-        <select id="loadType" style="width:120px">
+        <select id="loadType" style="width:190px">
           <option value="skaters">Skaters</option>
-          <option value="goalies">Goalies</option>
+          <option value="goalies">Goalies (MoneyPuck)</option>
+          <option value="goalie_decisions">Goalie Decisions (Hockey-Reference)</option>
         </select>
       </div>
       <div>
@@ -863,6 +864,79 @@ async function loadGoaliesFromCSV(results, season, status) {
   toast(`Season ${season} goalies loaded (${rows.length} rows)`);
 }
 
+/* Hockey-Reference's "Get table as CSV" export from a leagues/NHL_{year}_goalies.html
+   page: has W/L/OT/GS/SO/G/A/PTS/PIM that MoneyPuck's own export lacks. This is a
+   MERGE, not a replace - it patches those specific fields onto whatever goalie row
+   already exists for that name+season (from a MoneyPuck load), or creates a
+   minimal new row if none exists yet. It deliberately never touches
+   games_played/icetime/shots_against/goals_against/xGoals/danger-zone fields,
+   since MoneyPuck's shot-based numbers for those are more granular and are what
+   GSAx is built on - this source only fills in what MoneyPuck's export can't.
+*/
+async function loadGoalieDecisionsFromCSV(results, season, status) {
+  const headers = results.meta.fields;
+  const colmap = {
+    name: findCol(headers, ["Player", "name"]),
+    games_started: findCol(headers, ["GS"]),
+    wins: findCol(headers, ["W"]),
+    losses: findCol(headers, ["L"]),
+    ot_losses: findCol(headers, ["T/O", "OTL", "OT"]),
+    shutouts: findCol(headers, ["SO"]),
+    off_goals: findCol(headers, ["G"]),
+    off_assists: findCol(headers, ["A"]),
+    off_points: findCol(headers, ["PTS", "P"]),
+  };
+  if (!colmap.name) { status.textContent = "ERROR: couldn't find a Player/name column in this file."; return; }
+  const missing = Object.entries(colmap).filter(([k,v]) => v===null && k!=="name").map(([k]) => k);
+  if (missing.length) { console.warn(`Goalie decisions CSV doesn't include: ${missing.join(", ")}`); }
+
+  const existing = await dbGetBySeason("goalieRows", season);
+  const existingAllMap = {}, normalizedMap = {};
+  const normalize = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+  existing.filter(r => r.situation === "all").forEach(r => {
+    existingAllMap[r.name] = r;
+    normalizedMap[normalize(r.name)] = r;
+  });
+
+  const db = await openDB();
+  const tx = db.transaction("goalieRows", "readwrite");
+  const store = tx.objectStore("goalieRows");
+  let mergedCount = 0, createdCount = 0, skipped = 0;
+
+  results.data.forEach(r => {
+    const name = r[colmap.name];
+    if (!name || name === "Player") { skipped++; return; } // guards a stray repeated header row
+    const patch = {
+      games_started: colmap.games_started ? num(r[colmap.games_started]) : null,
+      wins: colmap.wins ? num(r[colmap.wins]) : null,
+      losses: colmap.losses ? num(r[colmap.losses]) : null,
+      ot_losses: colmap.ot_losses ? num(r[colmap.ot_losses]) : null,
+      shutouts: colmap.shutouts ? num(r[colmap.shutouts]) : null,
+      off_goals: colmap.off_goals ? num(r[colmap.off_goals]) : null,
+      off_assists: colmap.off_assists ? num(r[colmap.off_assists]) : null,
+      off_points: colmap.off_points ? num(r[colmap.off_points]) : null,
+    };
+    // Try an exact name match first, then a diacritic/case-insensitive match -
+    // Hockey-Reference uses accents (e.g. "Vítek Vaněček") that MoneyPuck strips.
+    const existingRow = existingAllMap[name] || normalizedMap[normalize(name)];
+    if (existingRow) {
+      Object.assign(existingRow, patch);
+      store.put(existingRow);
+      mergedCount++;
+    } else {
+      store.add({ season, situation: "all", name, team: null, games_played: null, icetime: null,
+        shots_against: null, goals_against: null, xgoals: null,
+        ld_shots: null, md_shots: null, hd_shots: null, ld_xg: null, md_xg: null, hd_xg: null,
+        ld_goals: null, md_goals: null, hd_goals: null, pim: null, ...patch });
+      createdCount++;
+    }
+  });
+  await txDone(tx);
+  status.textContent = `Merged decisions into ${mergedCount} existing goalie rows, created ${createdCount} new ` +
+    `entries for season ${season}${skipped ? ` (skipped ${skipped} non-player rows)` : ""}.`;
+  toast(`Goalie decisions: ${mergedCount} merged, ${createdCount} new`);
+}
+
 document.getElementById("loadBtn").addEventListener("click", () => {
   const season = Number(document.getElementById("loadSeason").value);
   const dataType = document.getElementById("loadType").value;
@@ -872,6 +946,7 @@ document.getElementById("loadBtn").addEventListener("click", () => {
     header: true, skipEmptyLines: true,
     complete: async (results) => {
       if (dataType === "goalies") await loadGoaliesFromCSV(results, season, status);
+      else if (dataType === "goalie_decisions") await loadGoalieDecisionsFromCSV(results, season, status);
       else await loadSkatersFromCSV(results, season, status);
       pendingFile = null; document.getElementById("loadFile").value = "";
       document.getElementById("loadBtn").disabled = true;
