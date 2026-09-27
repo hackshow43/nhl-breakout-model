@@ -134,6 +134,7 @@
           <option value="skaters">Skaters</option>
           <option value="goalies">Goalies (MoneyPuck)</option>
           <option value="goalie_decisions">Goalie Decisions (Hockey-Reference)</option>
+          <option value="player_bios">Player Bios (MoneyPuck)</option>
         </select>
       </div>
       <div>
@@ -178,7 +179,7 @@
     </div>
     <details style="margin-top:12px">
       <summary style="cursor:pointer;font-size:13px;color:var(--muted)">Ages (optional, improves age-curve signal)</summary>
-      <p class="muted">Paste lines as <code>name,age</code>, one per line.</p>
+      <p class="muted">Paste lines as <code>name,age</code>, one per line - or leave this empty and load Player Bios (Load Data tab) to auto-fill ages instead.</p>
       <textarea id="agesInput" rows="4" style="width:100%" placeholder="Evan Bouchard,25&#10;Marco Rossi,23"></textarea>
     </details>
     <details style="margin-top:10px">
@@ -334,7 +335,7 @@
 
 <script>
 /* ======================= IndexedDB layer ======================= */
-const DB_NAME = "nhlBreakoutDB", DB_VERSION = 3;
+const DB_NAME = "nhlBreakoutDB", DB_VERSION = 4;
 let dbPromise = null;
 function openDB() {
   if (dbPromise) return dbPromise;
@@ -362,6 +363,11 @@ function openDB() {
         const s = db.createObjectStore("goalieRows", { keyPath: "id", autoIncrement: true });
         s.createIndex("season", "season");
         s.createIndex("name", "name");
+      }
+      if (!db.objectStoreNames.contains("playerBios")) {
+        const s = db.createObjectStore("playerBios", { keyPath: "id", autoIncrement: true });
+        s.createIndex("name", "name");
+        s.createIndex("player_id", "player_id");
       }
     };
     req.onsuccess = (e) => resolve(e.target.result);
@@ -466,6 +472,17 @@ function findCol(headers, candidates) {
   return null;
 }
 function num(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
+function normalizeName(s) { return (s||"").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim(); }
+function ageAsOfSeasonStart(birthDateStr, season) {
+  if (!birthDateStr) return null;
+  const seasonStart = new Date(`${season-1}-10-01`);
+  const bd = new Date(birthDateStr);
+  if (isNaN(bd.getTime())) return null;
+  let age = seasonStart.getFullYear() - bd.getFullYear();
+  const m = seasonStart.getMonth() - bd.getMonth();
+  if (m < 0 || (m === 0 && seasonStart.getDate() < bd.getDate())) age--;
+  return age;
+}
 
 /* ======================= Scoring model (mirrors the Python CLI) ======================= */
 function posGroup(pos) { return (pos && pos.toUpperCase().startsWith("D")) ? "D" : "F"; }
@@ -703,12 +720,19 @@ document.getElementById("fantasyResetBtn").addEventListener("click", async () =>
 
 /* --- Load tab --- */
 let pendingFile = null;
+function loadBtnCanEnable() {
+  const seasonNeeded = document.getElementById("loadType").value !== "player_bios";
+  return pendingFile && (!seasonNeeded || document.getElementById("loadSeason").value);
+}
 document.getElementById("loadFile").addEventListener("change", (e) => {
   pendingFile = e.target.files[0] || null;
-  document.getElementById("loadBtn").disabled = !(pendingFile && document.getElementById("loadSeason").value);
+  document.getElementById("loadBtn").disabled = !loadBtnCanEnable();
 });
 document.getElementById("loadSeason").addEventListener("input", () => {
-  document.getElementById("loadBtn").disabled = !(pendingFile && document.getElementById("loadSeason").value);
+  document.getElementById("loadBtn").disabled = !loadBtnCanEnable();
+});
+document.getElementById("loadType").addEventListener("change", () => {
+  document.getElementById("loadBtn").disabled = !loadBtnCanEnable();
 });
 
 function buildNameResolver(results, nameCol, idCol, positionCol) {
@@ -892,10 +916,9 @@ async function loadGoalieDecisionsFromCSV(results, season, status) {
 
   const existing = await dbGetBySeason("goalieRows", season);
   const existingAllMap = {}, normalizedMap = {};
-  const normalize = s => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
   existing.filter(r => r.situation === "all").forEach(r => {
     existingAllMap[r.name] = r;
-    normalizedMap[normalize(r.name)] = r;
+    normalizedMap[normalizeName(r.name)] = r;
   });
 
   const db = await openDB();
@@ -903,9 +926,24 @@ async function loadGoalieDecisionsFromCSV(results, season, status) {
   const store = tx.objectStore("goalieRows");
   let mergedCount = 0, createdCount = 0, skipped = 0;
 
+  // Traded players appear as multiple rows (a season-total "2TM"/"3TM" row
+  // plus one row per team). Keep only the season-total row when one exists,
+  // so a trade doesn't leave you with just their last team's partial line.
+  const byName = {};
   results.data.forEach(r => {
     const name = r[colmap.name];
-    if (!name || name === "Player") { skipped++; return; } // guards a stray repeated header row
+    if (!name || name === "Player") { skipped++; return; }
+    (byName[name] = byName[name] || []).push(r);
+  });
+  const rowsToProcess = Object.entries(byName).map(([name, rows]) => {
+    if (rows.length === 1) return rows[0];
+    const teamCol = findCol(headers, ["Team", "Tm"]);
+    const totalRow = teamCol ? rows.find(r => /^\d+TM$/.test((r[teamCol]||"").trim())) : null;
+    return totalRow || rows[0]; // fall back to the first split if no total row exists
+  });
+
+  rowsToProcess.forEach(r => {
+    const name = r[colmap.name];
     const patch = {
       games_started: colmap.games_started ? num(r[colmap.games_started]) : null,
       wins: colmap.wins ? num(r[colmap.wins]) : null,
@@ -918,7 +956,7 @@ async function loadGoalieDecisionsFromCSV(results, season, status) {
     };
     // Try an exact name match first, then a diacritic/case-insensitive match -
     // Hockey-Reference uses accents (e.g. "Vítek Vaněček") that MoneyPuck strips.
-    const existingRow = existingAllMap[name] || normalizedMap[normalize(name)];
+    const existingRow = existingAllMap[name] || normalizedMap[normalizeName(name)];
     if (existingRow) {
       Object.assign(existingRow, patch);
       store.put(existingRow);
@@ -937,6 +975,75 @@ async function loadGoalieDecisionsFromCSV(results, season, status) {
   toast(`Goalie decisions: ${mergedCount} merged, ${createdCount} new`);
 }
 
+async function loadPlayerBiosFromCSV(results, status) {
+  const headers = results.meta.fields;
+  const colmap = {
+    playerId: findCol(headers, ["playerId", "player_id"]),
+    name: findCol(headers, ["name"]),
+    position: findCol(headers, ["position"]),
+    team: findCol(headers, ["team"]),
+    birthDate: findCol(headers, ["birthDate"]),
+    weight: findCol(headers, ["weight"]),
+    height: findCol(headers, ["height"]),
+    nationality: findCol(headers, ["nationality"]),
+    shootsCatches: findCol(headers, ["shootsCatches"]),
+  };
+  if (!colmap.name) { status.textContent = "ERROR: couldn't find a name column in this file."; return; }
+  const missing = Object.entries(colmap).filter(([k,v]) => v===null && k!=="name").map(([k]) => k);
+  if (missing.length) { console.warn(`Player bios CSV doesn't include: ${missing.join(", ")}`); }
+
+  const rows = results.data.map(r => ({
+    player_id: colmap.playerId ? num(r[colmap.playerId]) : null,
+    name: r[colmap.name],
+    position: colmap.position ? r[colmap.position] : null,
+    team: colmap.team ? r[colmap.team] : null,
+    birth_date: colmap.birthDate ? r[colmap.birthDate] : null,
+    weight: colmap.weight ? num(r[colmap.weight]) : null,
+    height: colmap.height ? r[colmap.height] : null,
+    nationality: colmap.nationality ? r[colmap.nationality] : null,
+    shoots_catches: colmap.shootsCatches ? r[colmap.shootsCatches] : null,
+  })).filter(r => r.name);
+
+  // This is a reference table, not season-scoped - replace it wholesale each load.
+  const db = await openDB();
+  const tx = db.transaction("playerBios", "readwrite");
+  const store = tx.objectStore("playerBios");
+  store.clear();
+  rows.forEach(r => store.add(r));
+  await txDone(tx);
+  status.textContent = `Loaded ${rows.length} player bios.`;
+  toast(`Loaded ${rows.length} player bios`);
+}
+
+/* Look up a bio by name, handling the same disambiguated "(POS)" suffix
+   names use when two real players share a name, and falling back to an
+   accent/case-insensitive match. */
+async function getBioForName(name) {
+  const bios = await dbGetAll("playerBios");
+  if (!bios.length) return null;
+  const byExact = {}, byNorm = {};
+  bios.forEach(b => {
+    (byExact[b.name] = byExact[b.name] || []).push(b);
+    (byNorm[normalizeName(b.name)] = byNorm[normalizeName(b.name)] || []).push(b);
+  });
+  const m = name.match(/^(.*) \(([A-Z]+)\)$/);
+  const baseName = m ? m[1] : name;
+  const posHint = m ? m[2] : null;
+  let candidates = byExact[baseName] || byNorm[normalizeName(baseName)] || [];
+  if (candidates.length > 1 && posHint) {
+    const match = candidates.find(b => (b.position||"").toUpperCase().startsWith(posHint[0]));
+    if (match) candidates = [match];
+  }
+  return candidates[0] || null;
+}
+async function computeAgesFromBios(season) {
+  const bios = await dbGetAll("playerBios");
+  if (!bios.length) return null;
+  const map = {};
+  bios.forEach(b => { if (b.birth_date) { const age = ageAsOfSeasonStart(b.birth_date, season); if (age != null) map[b.name] = age; } });
+  return Object.keys(map).length ? map : null;
+}
+
 document.getElementById("loadBtn").addEventListener("click", () => {
   const season = Number(document.getElementById("loadSeason").value);
   const dataType = document.getElementById("loadType").value;
@@ -947,6 +1054,7 @@ document.getElementById("loadBtn").addEventListener("click", () => {
     complete: async (results) => {
       if (dataType === "goalies") await loadGoaliesFromCSV(results, season, status);
       else if (dataType === "goalie_decisions") await loadGoalieDecisionsFromCSV(results, season, status);
+      else if (dataType === "player_bios") await loadPlayerBiosFromCSV(results, status);
       else await loadSkatersFromCSV(results, season, status);
       pendingFile = null; document.getElementById("loadFile").value = "";
       document.getElementById("loadBtn").disabled = true;
@@ -1114,7 +1222,7 @@ document.getElementById("rankBtn").addEventListener("click", async () => {
   const currentSeason = document.getElementById("rankCurrent").value;
   const priorSeason = document.getElementById("rankPrior").value;
   if (!currentSeason) { toast("Load a season first"); return; }
-  const ages = parseAges();
+  const ages = parseAges() || await computeAgesFromBios(Number(currentSeason));
   const minGp = Number(document.getElementById("rankMinGp").value) || 0;
   const weights = currentWeights();
   const { rows, activeWeights } = await computeBreakoutScores(currentSeason, priorSeason, ages, weights, minGp);
@@ -1522,9 +1630,25 @@ async function tryShowGoalieCard(name) {
       ${zoneTables}`;
   }
 
+  const bio = await getBioForName(name);
+  let bioLine = "";
+  if (bio) {
+    const parts = [];
+    if (bio.birth_date) {
+      const age = ageAsOfSeasonStart(bio.birth_date, (seasons[seasons.length-1]||{}).season || new Date().getFullYear());
+      parts.push(`Born ${bio.birth_date}${age!=null ? ` (age ${age})` : ""}`);
+    }
+    if (bio.nationality) parts.push(bio.nationality);
+    if (bio.height) parts.push(bio.height);
+    if (bio.weight) parts.push(`${bio.weight} lb`);
+    if (bio.shoots_catches) parts.push(`Catches ${bio.shoots_catches}`);
+    if (parts.length) bioLine = `<p class="muted">${parts.join(" \u2022 ")}</p>`;
+  }
+
   document.getElementById("playerCard").innerHTML = `
     <div class="card">
       <div class="playercard-head"><h3>${name}</h3><span class="pill">G</span></div>
+      ${bioLine}
       <div class="stat-grid">
         <div class="stat-box"><div class="num">${seasons.length}</div><div class="lbl">Seasons loaded</div></div>
         <div class="stat-box"><div class="num">${careerGp}</div><div class="lbl">Career GP (loaded)</div></div>
@@ -1591,9 +1715,25 @@ async function showPlayerCard(name) {
     ? `<div class="stat-box"><div class="num">${careerFantasy.toFixed(1)}</div><div class="lbl">Career fantasy pts (loaded)</div></div>`
     : "";
 
+  const bio = await getBioForName(name);
+  let bioLine = "";
+  if (bio) {
+    const parts = [];
+    if (bio.birth_date) {
+      const age = ageAsOfSeasonStart(bio.birth_date, (seasons[seasons.length-1]||{}).season || new Date().getFullYear());
+      parts.push(`Born ${bio.birth_date}${age!=null ? ` (age ${age})` : ""}`);
+    }
+    if (bio.nationality) parts.push(bio.nationality);
+    if (bio.height) parts.push(bio.height);
+    if (bio.weight) parts.push(`${bio.weight} lb`);
+    if (bio.shoots_catches) parts.push(`Shoots ${bio.shoots_catches}`);
+    if (parts.length) bioLine = `<p class="muted">${parts.join(" \u2022 ")}</p>`;
+  }
+
   document.getElementById("playerCard").innerHTML = `
     <div class="card">
       <div class="playercard-head"><h3>${name}</h3><span class="pill">${positions}</span></div>
+      ${bioLine}
       <div class="stat-grid">
         <div class="stat-box"><div class="num">${seasons.length}</div><div class="lbl">Seasons loaded</div></div>
         <div class="stat-box"><div class="num">${careerGp}</div><div class="lbl">Career GP (loaded)</div></div>
