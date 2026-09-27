@@ -100,6 +100,12 @@
   .playerchip:hover { background: var(--accent-soft); }
   .playercard-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
   .playercard-head h3 { margin: 0; text-transform: none; font-size: 17px; color: var(--text); }
+  th.col-past, td.col-past { color: var(--text); }
+  th.col-future, td.col-future { color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+  th.col-future { border-bottom: 2px solid var(--accent); }
+  .score-toggle { cursor: pointer; border-bottom: 1px dotted var(--muted); }
+  .score-toggle:hover { color: var(--accent); }
+  .legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
 </style>
 </head>
 <body>
@@ -177,6 +183,11 @@
   </div>
   <div class="card">
     <p id="calibrationNote" class="muted"></p>
+    <p class="muted">
+      <span class="legend-dot" style="background:var(--text)"></span>current season (actual)
+      &nbsp;&nbsp;
+      <span class="legend-dot" style="background:var(--accent)"></span>expected / next season (projected)
+    </p>
     <div class="tablewrap"><table id="rankTable"><thead></thead><tbody></tbody></table></div>
     <p id="rankEmpty" class="empty">Load at least one season, then compute rankings.</p>
   </div>
@@ -689,6 +700,28 @@ async function computeCalibration(weights, minGp) {
 }
 
 let lastRankResults = null;
+const RANK_COLUMNS = [
+  { key: "model_rank",   label: "Rank",        group: "past" },
+  { key: "name",         label: "Name",        group: "past" },
+  { key: "position",     label: "Pos",         group: "past" },
+  { key: "games_played", label: "GP",          group: "past" },
+  { key: "season_points",label: "Pts (this season)", group: "past" },
+  { key: "season_ppg",   label: "PPG (this season)", group: "past", decimals: 2 },
+  { key: "luck_gap",     label: "Luck gap",    group: "past", decimals: 2 },
+  { key: "shots60",      label: "Shots/60",    group: "past", decimals: 1 },
+  { key: "pp_trend",     label: "PP trend",    group: "past", decimals: 1 },
+  { key: "gp_bonus",     label: "GP bonus",    group: "past", decimals: 2 },
+  { key: "breakout_score", label: "Breakout score", group: "past", expandable: true },
+  { key: "pct_change",   label: "Expected % change", group: "future", isPct: true },
+  { key: "expected_pts_next", label: "Expected pts (next season)", group: "future" },
+];
+
+function toggleScoreCell(el) {
+  const showingFull = el.dataset.state === "full";
+  el.textContent = showingFull ? el.dataset.short : el.dataset.full;
+  el.dataset.state = showingFull ? "short" : "full";
+}
+
 document.getElementById("rankBtn").addEventListener("click", async () => {
   const currentSeason = document.getElementById("rankCurrent").value;
   const priorSeason = document.getElementById("rankPrior").value;
@@ -698,35 +731,53 @@ document.getElementById("rankBtn").addEventListener("click", async () => {
   const weights = currentWeights();
   const { rows, activeWeights } = await computeBreakoutScores(currentSeason, priorSeason, ages, weights, minGp);
 
+  // This season's own totals - always shown, independent of whether calibration is usable.
+  const allRows = await dbGetAll("skaterRows");
+  const baselineMap = {};
+  allRows.filter(r=>r.situation==="all" && r.season===Number(currentSeason))
+    .forEach(r => baselineMap[r.name] = r.ind_points);
+  rows.forEach(r => {
+    const pts = baselineMap[r.name];
+    r.season_points = pts ?? null;
+    r.season_ppg = (pts != null && r.games_played) ? pts / r.games_played : null;
+  });
+
   const calib = await computeCalibration(weights, minGp);
   const note = document.getElementById("calibrationNote");
   if (calib.usable) {
-    const allRows = await dbGetAll("skaterRows");
-    const baselineMap = {};
-    allRows.filter(r=>r.situation==="all" && r.season===Number(currentSeason))
-      .forEach(r => baselineMap[r.name] = r.ind_points);
     rows.forEach(r => {
-      const base = baselineMap[r.name];
-      r.expected_pts_next = (base != null)
-        ? Math.max(0, base * (1 + calib.intercept + calib.slope * r.breakout_score))
-        : null;
+      if (r.season_points == null) { r.pct_change = null; r.expected_pts_next = null; return; }
+      r.pct_change = calib.intercept + calib.slope * r.breakout_score;
+      r.expected_pts_next = Math.max(0, Math.floor(r.season_points * (1 + r.pct_change)));
     });
-    note.textContent = `Expected next-season points calibrated from ${calib.n} player-season transitions across your loaded seasons. `+
+    note.textContent = `Expected points calibrated from ${calib.n} player-season transitions across your loaded seasons. `+
       (calib.n < 50 ? "That's a small sample - treat these numbers as rough, not precise." : "");
   } else {
-    rows.forEach(r => r.expected_pts_next = null);
+    rows.forEach(r => { r.pct_change = null; r.expected_pts_next = null; });
     note.textContent = "Not enough season-to-season history to calibrate expected points yet - load at least two consecutive seasons.";
   }
 
   lastRankResults = rows;
   const table = document.getElementById("rankTable");
-  const cols = ["model_rank","name","position","games_played","luck_gap","shots60","pp_trend","gp_bonus","breakout_score","expected_pts_next"];
-  table.querySelector("thead").innerHTML = "<tr>" + cols.map(c=>`<th>${c.replace(/_/g," ")}</th>`).join("") + "</tr>";
-  table.querySelector("tbody").innerHTML = rows.map(r => "<tr>" + cols.map(c => {
-    let v = r[c];
-    if (typeof v === "number") v = Math.round(v*1000)/1000;
-    return `<td>${v ?? ""}</td>`;
+  table.querySelector("thead").innerHTML = "<tr>" + RANK_COLUMNS.map(c =>
+    `<th class="col-${c.group}">${c.label}</th>`).join("") + "</tr>";
+  table.querySelector("tbody").innerHTML = rows.map(r => "<tr>" + RANK_COLUMNS.map(c => {
+    const v = r[c.key];
+    if (v == null) return `<td class="col-${c.group}"></td>`;
+    if (c.expandable) {
+      const full = v.toFixed(3), short = v.toFixed(1);
+      return `<td class="col-${c.group}"><span class="score-toggle" data-short="${short}" data-full="${full}" data-state="short" title="Click to expand">${short}</span></td>`;
+    }
+    if (c.isPct) {
+      const pct = v * 100;
+      return `<td class="col-${c.group}">${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%</td>`;
+    }
+    if (typeof v === "number") {
+      return `<td class="col-${c.group}">${c.decimals != null ? v.toFixed(c.decimals) : v}</td>`;
+    }
+    return `<td class="col-${c.group}">${v}</td>`;
   }).join("") + "</tr>").join("");
+  table.querySelectorAll(".score-toggle").forEach(el => el.addEventListener("click", () => toggleScoreCell(el)));
   document.getElementById("rankEmpty").style.display = rows.length ? "none" : "block";
   document.getElementById("activeWeightsNote").textContent = "Active (renormalized): " +
     Object.entries(activeWeights).map(([k,v])=>`${k}=${v.toFixed(2)}`).join(", ");
@@ -734,7 +785,7 @@ document.getElementById("rankBtn").addEventListener("click", async () => {
 
 document.getElementById("rankExportBtn").addEventListener("click", async () => {
   if (!lastRankResults) { toast("Compute rankings first"); return; }
-  const cols = ["model_rank","name","position","games_played","luck_gap","shots60","pp_trend","gp_bonus","breakout_score","expected_pts_next"];
+  const cols = RANK_COLUMNS.map(c=>c.key);
   const csv = [cols.join(",")].concat(lastRankResults.map(r => cols.map(c=>r[c]).join(","))).join("\n");
   await exportCSV("breakout_rankings.csv", csv);
 });
