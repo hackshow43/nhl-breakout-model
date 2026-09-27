@@ -112,19 +112,18 @@
 
 <nav id="nav">
   <h1>🏒 Breakout Model</h1>
-  <button class="navbtn" data-tab="load">Load Data</button>
-  <button class="navbtn" data-tab="seasons">Seasons</button>
   <button class="navbtn" data-tab="rankings">Rankings</button>
   <button class="navbtn" data-tab="leaders">Stat Leaders</button>
   <button class="navbtn" data-tab="players">Players</button>
   <button class="navbtn" data-tab="career">Career Chart</button>
   <button class="navbtn" data-tab="prospects">Prospects &amp; Leagues</button>
   <button class="navbtn" data-tab="backtest">Backtest</button>
+  <button class="navbtn" data-tab="data">Load Data</button>
 </nav>
 
 <main>
 
-<section id="tab-load">
+<section id="tab-data" style="display:none">
   <h2>Load Season Data</h2>
   <p class="muted">Upload a MoneyPuck-style "skaters" CSV (situation-level: rows for 5on5, 5on4, all, etc.) and tag it with a season number. Re-loading a season replaces its existing rows.</p>
   <div class="card">
@@ -143,16 +142,14 @@
   </div>
   <h3>Convention</h3>
   <p class="muted">Season number = the year it ends in. 2024-25 season &rarr; enter 2025. Be consistent every time you load, or seasons will get mixed up in comparisons.</p>
-</section>
 
-<section id="tab-seasons" style="display:none">
-  <h2>Loaded Seasons</h2>
+  <h2 style="margin-top:24px">Loaded Seasons</h2>
   <div class="card">
     <div id="seasonsTableWrap" class="tablewrap"></div>
   </div>
 </section>
 
-<section id="tab-rankings" style="display:none">
+<section id="tab-rankings">
   <h2>Breakout Rankings</h2>
   <div class="card">
     <div class="row">
@@ -522,7 +519,7 @@ document.querySelectorAll(".navbtn").forEach(btn => {
     btn.classList.add("active");
     document.querySelectorAll("main > section").forEach(s => s.style.display = "none");
     document.getElementById("tab-"+btn.dataset.tab).style.display = "block";
-    if (btn.dataset.tab === "seasons") renderSeasonsTab();
+    if (btn.dataset.tab === "data") renderSeasonsTab();
     if (btn.dataset.tab === "rankings") refreshSeasonDropdowns();
     if (btn.dataset.tab === "leaders") { refreshSeasonDropdowns().then(loadLeadersData); }
     if (btn.dataset.tab === "players") renderPlayersTab();
@@ -531,7 +528,7 @@ document.querySelectorAll(".navbtn").forEach(btn => {
     if (btn.dataset.tab === "backtest") refreshSeasonDropdowns();
   });
 });
-document.querySelector('.navbtn[data-tab="load"]').classList.add("active");
+document.querySelector('.navbtn[data-tab="rankings"]').classList.add("active");
 
 /* --- Load tab --- */
 let pendingFile = null;
