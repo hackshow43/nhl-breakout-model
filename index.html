@@ -200,7 +200,10 @@
   <div class="card">
     <div class="row">
       <div><label>Season</label><select id="leadersSeason"></select></div>
+      <div><label>Team</label><select id="leadersTeam"><option value="">All Teams</option></select></div>
+      <div><label>Position</label><select id="leadersPosition"><option value="">All Positions</option></select></div>
       <div><label>Min GP</label><input type="number" id="leadersMinGp" value="10" style="width:80px" /></div>
+      <button class="btn secondary" id="leadersResetBtn">Reset filters</button>
     </div>
   </div>
   <div class="card">
@@ -558,6 +561,7 @@ document.getElementById("loadBtn").addEventListener("click", () => {
         ind_points: findCol(headers, ["I_F_points","Points","P"]),
         ind_xgoals: findCol(headers, ["I_F_xGoals","ixG","Ind_xGoals"]),
         ind_shot_attempts: findCol(headers, ["I_F_shotAttempts","iCF","Corsi"]),
+        ind_shots_on_goal: findCol(headers, ["I_F_shotsOnGoal"]),
         onice_goals: findCol(headers, ["OnIce_F_goals","onIce_goals"]),
         onice_shots_on_goal: findCol(headers, ["OnIce_F_shotsOnGoal","onIce_shotsOnGoal"])
       };
@@ -599,6 +603,7 @@ document.getElementById("loadBtn").addEventListener("click", () => {
         games_played: num(r[colmap.games_played]), icetime: num(r[colmap.icetime]),
         ind_goals: num(r[colmap.ind_goals]), ind_points: num(r[colmap.ind_points]),
         ind_xgoals: num(r[colmap.ind_xgoals]), ind_shot_attempts: num(r[colmap.ind_shot_attempts]),
+        ind_shots_on_goal: num(r[colmap.ind_shots_on_goal]),
         onice_goals: num(r[colmap.onice_goals]), onice_shots_on_goal: num(r[colmap.onice_shots_on_goal])
       })).filter(r => r.name);
       const collisions = Object.entries(nameToIds).filter(([,ids])=>ids.size>1).map(([n])=>n);
@@ -912,8 +917,11 @@ const LEADER_COLUMNS = [
   { key:"ind_points", label:"PTS" },
   { key:"ppg", label:"PPG", decimals: 2 },
   { key:"ind_xgoals", label:"xG", decimals: 1 },
+  { key:"luck", label:"Luck (G\u2212xG)", decimals: 1 },
+  { key:"sh_pct", label:"Sh%", decimals: 1 },
   { key:"ind_shot_attempts", label:"Shot Att" },
 ];
+let leadersRawData = [];
 let leadersData = [];
 let leadersSort = { key: "ind_points", dir: -1 };
 
@@ -921,12 +929,38 @@ async function loadLeadersData() {
   const seasonSel = document.getElementById("leadersSeason");
   const season = Number(seasonSel.value);
   const minGp = Number(document.getElementById("leadersMinGp").value) || 0;
-  if (!season) { leadersData = []; renderLeadersTable(); return; }
+  if (!season) { leadersRawData = []; leadersData = []; renderLeadersTable(); return; }
   const allRows = await dbGetAll("skaterRows");
-  leadersData = allRows.filter(r => r.season===season && r.situation==="all" && r.games_played>=minGp)
-    .map(r => ({ ...r, assists: r.ind_points - r.ind_goals, ppg: r.games_played ? r.ind_points/r.games_played : 0 }));
+  leadersRawData = allRows.filter(r => r.season===season && r.situation==="all" && r.games_played>=minGp)
+    .map(r => ({ ...r, assists: r.ind_points - r.ind_goals, ppg: r.games_played ? r.ind_points/r.games_played : 0,
+                 luck: r.ind_goals - r.ind_xgoals,
+                 sh_pct: r.ind_shots_on_goal ? (r.ind_goals / r.ind_shots_on_goal * 100) : null }));
+
+  const teamSel = document.getElementById("leadersTeam"), posSel = document.getElementById("leadersPosition");
+  const curTeam = teamSel.value, curPos = posSel.value;
+  const teams = [...new Set(leadersRawData.map(r=>r.team).filter(Boolean))].sort();
+  const positions = [...new Set(leadersRawData.map(r=>r.position).filter(Boolean))].sort();
+  teamSel.innerHTML = '<option value="">All Teams</option>' + teams.map(t=>`<option value="${t}">${t}</option>`).join("");
+  posSel.innerHTML = '<option value="">All Positions</option>' + positions.map(p=>`<option value="${p}">${p}</option>`).join("");
+  if (teams.includes(curTeam)) teamSel.value = curTeam;
+  if (positions.includes(curPos)) posSel.value = curPos;
+
+  applyLeaderFilters();
+}
+function applyLeaderFilters() {
+  const team = document.getElementById("leadersTeam").value;
+  const position = document.getElementById("leadersPosition").value;
+  leadersData = leadersRawData.filter(r =>
+    (!team || r.team === team) && (!position || r.position === position));
   renderLeadersTable();
 }
+document.getElementById("leadersTeam").addEventListener("change", applyLeaderFilters);
+document.getElementById("leadersPosition").addEventListener("change", applyLeaderFilters);
+document.getElementById("leadersResetBtn").addEventListener("click", () => {
+  document.getElementById("leadersTeam").value = "";
+  document.getElementById("leadersPosition").value = "";
+  applyLeaderFilters();
+});
 function compareLeaderVals(a, b, key, dir) {
   const av = a[key], bv = b[key];
   if (typeof av === "string" || typeof bv === "string") return String(av).localeCompare(String(bv)) * dir;
@@ -935,7 +969,13 @@ function compareLeaderVals(a, b, key, dir) {
 function renderLeadersTable() {
   const table = document.getElementById("leadersTable");
   const empty = document.getElementById("leadersEmpty");
-  if (!leadersData.length) { table.innerHTML = ""; empty.style.display = "block"; return; }
+  if (!leadersData.length) {
+    table.innerHTML = "";
+    empty.textContent = document.getElementById("leadersSeason").value
+      ? "No players match the current filters." : "Pick a season to see stat leaders.";
+    empty.style.display = "block";
+    return;
+  }
   empty.style.display = "none";
   const sorted = [...leadersData].sort((a,b) => compareLeaderVals(a, b, leadersSort.key, leadersSort.dir));
   table.innerHTML = "<thead><tr>" + LEADER_COLUMNS.map(c => {
@@ -1036,6 +1076,40 @@ async function showPlayerCard(name) {
 
 /* --- Career chart --- */
 const chartInstances = {};
+function linRegress(points) {
+  const n = points.length;
+  if (n < 2) return null;
+  const mx = points.reduce((a,p)=>a+p.x,0)/n, my = points.reduce((a,p)=>a+p.y,0)/n;
+  let cov=0, varx=0;
+  points.forEach(p => { cov += (p.x-mx)*(p.y-my); varx += (p.x-mx)**2; });
+  if (varx === 0) return null;
+  const slope = cov/varx;
+  return { slope, intercept: my - slope*mx };
+}
+
+/* For each NHL season this player has, compute what the breakout model
+   would have expected that season's points to be, based on their score
+   as of the PRIOR season - so this line only starts once there's a prior
+   season to have scored them from. */
+async function computeExpectedLine(name, nhlSeasons, calib, allSkaterSeasons) {
+  if (!calib.usable) return [];
+  const points = [];
+  for (const row of nhlSeasons) {
+    const priorS = row.season - 1;
+    if (!allSkaterSeasons.includes(priorS) || !row.gp) continue;
+    const priorPriorS = allSkaterSeasons.includes(priorS - 1) ? priorS - 1 : null;
+    const { rows: scored } = await computeBreakoutScores(priorS, priorPriorS, null, DEFAULT_WEIGHTS, 0);
+    const p = scored.find(r => r.name === name);
+    if (!p) continue;
+    const baseRows = await dbGetBySeason("skaterRows", priorS);
+    const baseRow = baseRows.find(r => r.name === name && r.situation === "all");
+    if (!baseRow) continue;
+    const expectedPts = Math.max(0, baseRow.ind_points * (1 + calib.intercept + calib.slope * p.breakout_score));
+    points.push({ x: row.season, y: expectedPts / row.gp });
+  }
+  return points;
+}
+
 async function plotCareerChart(canvasId, names) {
   if (chartInstances[canvasId]) { chartInstances[canvasId].destroy(); delete chartInstances[canvasId]; }
   const canvas = document.getElementById(canvasId);
@@ -1044,23 +1118,43 @@ async function plotCareerChart(canvasId, names) {
   const leagueMap = {}; leagues.forEach(l => leagueMap[l.league_code] = l.nhle_coefficient);
   const allSkater = await dbGetAll("skaterRows");
   const allProspect = await dbGetAll("prospectRows");
+  const allSkaterSeasons = [...new Set(allSkater.map(r=>r.season))].sort((a,b)=>a-b);
+  const calib = await computeCalibration(DEFAULT_WEIGHTS, 0, null);
 
   const datasets = [];
   const palette = ["#2563eb","#f97316","#16a34a","#dc2626","#7c3aed","#0891b2"];
 
-  names.forEach((name, i) => {
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
     const color = palette[i % palette.length];
     const prospect = allProspect.filter(r => r.name === name)
       .map(r => ({ season: r.season, ppg: (leagueMap[r.league_code]||1) * (r.points / (r.games_played||1)) }))
       .sort((a,b)=>a.season-b.season);
     const nhl = allSkater.filter(r => r.name === name && r.situation === "all")
-      .map(r => ({ season: r.season, ppg: r.ind_points / (r.games_played||1) }))
+      .map(r => ({ season: r.season, ppg: r.ind_points / (r.games_played||1), gp: r.games_played }))
       .sort((a,b)=>a.season-b.season);
+
     if (prospect.length) datasets.push({ label: name+" (pre-NHL, translated)", data: prospect.map(p=>({x:p.season,y:p.ppg})),
-      borderColor: color, borderDash: [6,4], backgroundColor: color, showLine: true });
+      borderColor: color, borderDash: [6,4], backgroundColor: color, showLine: true, pointRadius: 3 });
     if (nhl.length) datasets.push({ label: name+" (NHL, actual)", data: nhl.map(p=>({x:p.season,y:p.ppg})),
-      borderColor: color, backgroundColor: color, showLine: true });
-  });
+      borderColor: color, backgroundColor: color, showLine: true, pointRadius: 3, borderWidth: 2 });
+
+    // Trend line: simple linear regression across the whole combined trajectory.
+    const combined = [...prospect.map(p=>({x:p.season,y:p.ppg})), ...nhl.map(p=>({x:p.season,y:p.ppg}))].sort((a,b)=>a.x-b.x);
+    const trend = linRegress(combined);
+    if (trend) {
+      const xs = combined.map(p=>p.x), minX = Math.min(...xs), maxX = Math.max(...xs);
+      datasets.push({ label: name+" (trend)",
+        data: [{x:minX, y:trend.slope*minX+trend.intercept}, {x:maxX, y:trend.slope*maxX+trend.intercept}],
+        borderColor: color, borderWidth: 1, borderDash: [2,2], pointRadius: 0, backgroundColor: color, showLine: true });
+    }
+
+    // Expected-performance line, from the breakout model's own calibration.
+    const expected = await computeExpectedLine(name, nhl, calib, allSkaterSeasons);
+    if (expected.length) datasets.push({ label: name+" (expected, model)", data: expected,
+      borderColor: color, borderWidth: 1.5, borderDash: [1,3], pointRadius: 2, pointStyle: "triangle",
+      backgroundColor: color, showLine: true });
+  }
 
   const ctx = canvas.getContext("2d");
   const isDark = matchMedia("(prefers-color-scheme: dark)").matches;
@@ -1071,7 +1165,8 @@ async function plotCareerChart(canvasId, names) {
     options: {
       parsing: false,
       scales: {
-        x: { type: "linear", ticks: { stepSize: 1, color: textColor }, grid: { color: gridColor }, title: { display:true, text:"Season", color:textColor } },
+        x: { type: "linear", ticks: { stepSize: 1, color: textColor, format: { useGrouping: false } },
+             grid: { color: gridColor }, title: { display:true, text:"Season", color:textColor } },
         y: { ticks: { color: textColor }, grid: { color: gridColor }, title: { display:true, text:"NHLe points/game", color:textColor } }
       },
       plugins: { legend: { labels: { color: textColor, font:{size:11} } } }
