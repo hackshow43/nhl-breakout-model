@@ -125,15 +125,22 @@
 
 <section id="tab-data" style="display:none">
   <h2>Load Season Data</h2>
-  <p class="muted">Upload a MoneyPuck-style "skaters" CSV (situation-level: rows for 5on5, 5on4, all, etc.) and tag it with a season number. Re-loading a season replaces its existing rows.</p>
+  <p class="muted">Upload a MoneyPuck-style CSV (situation-level: rows for 5on5, 5on4, all, etc.) and tag it with a season number. Re-loading a season replaces its existing rows of that type.</p>
   <div class="card">
     <div class="row">
+      <div>
+        <label>Data type</label>
+        <select id="loadType" style="width:120px">
+          <option value="skaters">Skaters</option>
+          <option value="goalies">Goalies</option>
+        </select>
+      </div>
       <div>
         <label>Season (e.g. 2025 for the 2024-25 season)</label>
         <input type="number" id="loadSeason" placeholder="2025" style="width:120px" />
       </div>
       <div>
-        <label>Skaters CSV file</label>
+        <label>CSV file</label>
         <input type="file" id="loadFile" accept=".csv" />
       </div>
       <button class="btn" id="loadBtn" disabled>Load Season</button>
@@ -215,9 +222,15 @@
   <p class="muted">Raw season totals for everyone loaded - click a column to sort, click a player's name to open their full profile (breakout score + career trajectory).</p>
   <div class="card">
     <div class="row">
+      <div><label>Type</label>
+        <select id="leadersType" style="width:110px">
+          <option value="skaters">Skaters</option>
+          <option value="goalies">Goalies</option>
+        </select>
+      </div>
       <div><label>Season</label><select id="leadersSeason"></select></div>
-      <div><label>Team</label><select id="leadersTeam"><option value="">All Teams</option></select></div>
-      <div><label>Position</label><select id="leadersPosition"><option value="">All Positions</option></select></div>
+      <div id="leadersTeamWrap"><label>Team</label><select id="leadersTeam"><option value="">All Teams</option></select></div>
+      <div id="leadersPositionWrap"><label>Position</label><select id="leadersPosition"><option value="">All Positions</option></select></div>
       <div><label>Min GP</label><input type="number" id="leadersMinGp" value="10" style="width:80px" /></div>
       <button class="btn secondary" id="leadersResetBtn">Reset filters</button>
     </div>
@@ -225,6 +238,7 @@
   <div class="card">
     <div class="tablewrap"><table id="leadersTable"><thead></thead><tbody></tbody></table></div>
     <p id="leadersEmpty" class="empty">Pick a season to see stat leaders.</p>
+    <p class="muted" style="margin-top:8px">GSAx = goals saved above expected (xGoals &minus; goals allowed) &mdash; the standard way to isolate goalie skill from shot quality/team defense. *HD Sv% is based on unblocked high-danger attempts (on-goal + missed), not shots-on-goal only, so it won't exactly match Sv% calculators elsewhere.</p>
   </div>
 </section>
 
@@ -319,7 +333,7 @@
 
 <script>
 /* ======================= IndexedDB layer ======================= */
-const DB_NAME = "nhlBreakoutDB", DB_VERSION = 2;
+const DB_NAME = "nhlBreakoutDB", DB_VERSION = 3;
 let dbPromise = null;
 function openDB() {
   if (dbPromise) return dbPromise;
@@ -342,6 +356,11 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains("settings")) {
         db.createObjectStore("settings", { keyPath: "key" });
+      }
+      if (!db.objectStoreNames.contains("goalieRows")) {
+        const s = db.createObjectStore("goalieRows", { keyPath: "id", autoIncrement: true });
+        s.createIndex("season", "season");
+        s.createIndex("name", "name");
       }
     };
     req.onsuccess = (e) => resolve(e.target.result);
@@ -690,111 +709,206 @@ document.getElementById("loadFile").addEventListener("change", (e) => {
 document.getElementById("loadSeason").addEventListener("input", () => {
   document.getElementById("loadBtn").disabled = !(pendingFile && document.getElementById("loadSeason").value);
 });
+
+function buildNameResolver(results, nameCol, idCol, positionCol) {
+  const nameToIds = {};
+  if (idCol) {
+    results.data.forEach(r => {
+      const name = r[nameCol], id = r[idCol];
+      if (!name || id == null) return;
+      (nameToIds[name] = nameToIds[name] || new Set()).add(id);
+    });
+  }
+  const cache = {};
+  function resolveName(rawName, id, position) {
+    if (!idCol || id == null) return rawName;
+    const ids = nameToIds[rawName];
+    if (!ids || ids.size < 2) return rawName;
+    const key = rawName + "|" + id;
+    if (cache[key]) return cache[key];
+    const sortedIds = [...ids].sort((a,b)=>a-b);
+    const resolved = id === sortedIds[0] ? rawName : `${rawName} (${(position||"?").toUpperCase()})`;
+    cache[key] = resolved;
+    return resolved;
+  }
+  const collisionCount = Object.values(nameToIds).filter(ids=>ids.size>1).length;
+  return { resolveName, collisionCount };
+}
+
+async function loadSkatersFromCSV(results, season, status) {
+  const headers = results.meta.fields;
+  const colmap = {
+    name: findCol(headers, ["name","playerName","Player"]),
+    team: findCol(headers, ["team","Team"]),
+    position: findCol(headers, ["position","Position"]),
+    situation: findCol(headers, ["situation"]),
+    games_played: findCol(headers, ["games_played","GP","gamesPlayed"]),
+    icetime: findCol(headers, ["icetime","TOI","iceTime"]),
+    ind_goals: findCol(headers, ["I_F_goals","Goals","G"]),
+    ind_points: findCol(headers, ["I_F_points","Points","P"]),
+    ind_xgoals: findCol(headers, ["I_F_xGoals","ixG","Ind_xGoals"]),
+    ind_shot_attempts: findCol(headers, ["I_F_shotAttempts","iCF","Corsi"]),
+    ind_shots_on_goal: findCol(headers, ["I_F_shotsOnGoal"]),
+    onice_goals: findCol(headers, ["OnIce_F_goals","onIce_goals"]),
+    onice_shots_on_goal: findCol(headers, ["OnIce_F_shotsOnGoal","onIce_shotsOnGoal"]),
+    onice_against_goals: findCol(headers, ["OnIce_A_goals","onIce_A_goals"]),
+    ind_hits: findCol(headers, ["I_F_hits","hits","HIT"]),
+    ind_blocks: findCol(headers, ["shotsBlockedByPlayer","blocked_shots","BLK"]),
+    ind_pim: findCol(headers, ["I_F_penalityMinutes","penalityMinutes","PIM"])
+  };
+  const idCol = findCol(headers, ["playerId","player_id","ID"]);
+  const missing = Object.entries(colmap).filter(([k,v]) => v===null && k!=="team").map(([k])=>k);
+  if (missing.length) { status.textContent = "WARNING: missing columns: " + missing.join(", "); }
+  if (!idCol) { console.warn("No playerId column found - same-name player collisions can't be disambiguated for this file."); }
+
+  const { resolveName, collisionCount } = buildNameResolver(results, colmap.name, idCol, colmap.position);
+  const rows = results.data.map(r => ({
+    season, name: resolveName(r[colmap.name], idCol ? r[idCol] : null, r[colmap.position]),
+    team: colmap.team ? r[colmap.team] : null,
+    position: r[colmap.position], situation: r[colmap.situation],
+    games_played: num(r[colmap.games_played]), icetime: num(r[colmap.icetime]),
+    ind_goals: num(r[colmap.ind_goals]), ind_points: num(r[colmap.ind_points]),
+    ind_xgoals: num(r[colmap.ind_xgoals]), ind_shot_attempts: num(r[colmap.ind_shot_attempts]),
+    ind_shots_on_goal: num(r[colmap.ind_shots_on_goal]),
+    onice_goals: num(r[colmap.onice_goals]), onice_shots_on_goal: num(r[colmap.onice_shots_on_goal]),
+    onice_against_goals: num(r[colmap.onice_against_goals]),
+    ind_hits: num(r[colmap.ind_hits]), ind_blocks: num(r[colmap.ind_blocks]), ind_pim: num(r[colmap.ind_pim])
+  })).filter(r => r.name);
+  if (collisionCount) toast(`Note: disambiguated ${collisionCount} same-name collision(s)`);
+
+  await dbDeleteBySeason("skaterRows", season);
+  await dbAddRows("skaterRows", rows);
+  status.textContent = `Loaded ${rows.length} skater rows for season ${season}.`;
+  toast(`Season ${season} skaters loaded (${rows.length} rows)`);
+}
+
+async function loadGoaliesFromCSV(results, season, status) {
+  const headers = results.meta.fields;
+  const colmap = {
+    name: findCol(headers, ["name","playerName","Player"]),
+    team: findCol(headers, ["team","Team"]),
+    situation: findCol(headers, ["situation"]),
+    games_played: findCol(headers, ["games_played","GP","gamesPlayed"]),
+    games_started: findCol(headers, ["games_started","GS","gamesStarted"]),
+    wins: findCol(headers, ["wins","W"]),
+    losses: findCol(headers, ["losses","L"]),
+    ot_losses: findCol(headers, ["ot_losses","OT","otLosses","overtimeLosses"]),
+    icetime: findCol(headers, ["icetime","TOI","iceTime"]),
+    shots_against: findCol(headers, ["ongoal","shotsAgainst","SA","shots_against"]),
+    goals_against: findCol(headers, ["goals","goalsAgainst","GA","goals_against"]),
+    shutouts: findCol(headers, ["shutouts","SO"]),
+    off_goals: findCol(headers, ["skaterGoals","G_skater"]),
+    off_assists: findCol(headers, ["assists","A_skater","A"]),
+    off_points: findCol(headers, ["points","P_skater","P"]),
+    pim: findCol(headers, ["penalityMinutes","PIM"]),
+    xgoals: findCol(headers, ["xGoals"]),
+    ld_shots: findCol(headers, ["lowDangerShots"]),
+    md_shots: findCol(headers, ["mediumDangerShots"]),
+    hd_shots: findCol(headers, ["highDangerShots"]),
+    ld_xg: findCol(headers, ["lowDangerxGoals"]),
+    md_xg: findCol(headers, ["mediumDangerxGoals"]),
+    hd_xg: findCol(headers, ["highDangerxGoals"]),
+    ld_goals: findCol(headers, ["lowDangerGoals"]),
+    md_goals: findCol(headers, ["mediumDangerGoals"]),
+    hd_goals: findCol(headers, ["highDangerGoals"])
+  };
+  const idCol = findCol(headers, ["playerId","player_id","ID"]);
+  // Only warn about the columns MoneyPuck's goalie file actually provides -
+  // W/L/OT/SO/GS/G/A/P frequently aren't available from this source at all,
+  // so warning about those every time would just be noise.
+  const coreFields = ["name","team","situation","games_played","icetime","shots_against","goals_against","pim"];
+  const missing = coreFields.filter(k => colmap[k] === null && k !== "team");
+  if (missing.length) { status.textContent = "WARNING: missing columns: " + missing.join(", "); }
+  const unavailable = Object.entries(colmap)
+    .filter(([k,v]) => v===null && !coreFields.includes(k) &&
+      !["off_goals","off_assists","off_points","xgoals","ld_shots","md_shots","hd_shots",
+        "ld_xg","md_xg","hd_xg","ld_goals","md_goals","hd_goals"].includes(k))
+    .map(([k])=>k);
+  if (unavailable.length) {
+    console.warn(`Goalie CSV doesn't include: ${unavailable.join(", ")} - these will show blank until you have a source that provides them.`);
+  }
+
+  const { resolveName, collisionCount } = buildNameResolver(results, colmap.name, idCol, null);
+  const rows = results.data.map(r => ({
+    season, name: resolveName(r[colmap.name], idCol ? r[idCol] : null, null),
+    team: colmap.team ? r[colmap.team] : null, situation: r[colmap.situation],
+    games_played: num(r[colmap.games_played]),
+    games_started: colmap.games_started ? num(r[colmap.games_started]) : null,
+    wins: colmap.wins ? num(r[colmap.wins]) : null,
+    losses: colmap.losses ? num(r[colmap.losses]) : null,
+    ot_losses: colmap.ot_losses ? num(r[colmap.ot_losses]) : null,
+    icetime: num(r[colmap.icetime]),
+    shots_against: num(r[colmap.shots_against]), goals_against: num(r[colmap.goals_against]),
+    shutouts: colmap.shutouts ? num(r[colmap.shutouts]) : null,
+    off_goals: colmap.off_goals ? num(r[colmap.off_goals]) : null,
+    off_assists: colmap.off_assists ? num(r[colmap.off_assists]) : null,
+    off_points: colmap.off_points ? num(r[colmap.off_points]) : null,
+    pim: num(r[colmap.pim]),
+    xgoals: colmap.xgoals ? num(r[colmap.xgoals]) : null,
+    ld_shots: colmap.ld_shots ? num(r[colmap.ld_shots]) : null,
+    md_shots: colmap.md_shots ? num(r[colmap.md_shots]) : null,
+    hd_shots: colmap.hd_shots ? num(r[colmap.hd_shots]) : null,
+    ld_xg: colmap.ld_xg ? num(r[colmap.ld_xg]) : null,
+    md_xg: colmap.md_xg ? num(r[colmap.md_xg]) : null,
+    hd_xg: colmap.hd_xg ? num(r[colmap.hd_xg]) : null,
+    ld_goals: colmap.ld_goals ? num(r[colmap.ld_goals]) : null,
+    md_goals: colmap.md_goals ? num(r[colmap.md_goals]) : null,
+    hd_goals: colmap.hd_goals ? num(r[colmap.hd_goals]) : null
+  })).filter(r => r.name);
+  if (collisionCount) toast(`Note: disambiguated ${collisionCount} same-name collision(s)`);
+
+  await dbDeleteBySeason("goalieRows", season);
+  await dbAddRows("goalieRows", rows);
+  status.textContent = `Loaded ${rows.length} goalie rows for season ${season}.`;
+  toast(`Season ${season} goalies loaded (${rows.length} rows)`);
+}
+
 document.getElementById("loadBtn").addEventListener("click", () => {
   const season = Number(document.getElementById("loadSeason").value);
+  const dataType = document.getElementById("loadType").value;
   const status = document.getElementById("loadStatus");
   status.textContent = "Parsing...";
   Papa.parse(pendingFile, {
     header: true, skipEmptyLines: true,
     complete: async (results) => {
-      const headers = results.meta.fields;
-      const colmap = {
-        name: findCol(headers, ["name","playerName","Player"]),
-        team: findCol(headers, ["team","Team"]),
-        position: findCol(headers, ["position","Position"]),
-        situation: findCol(headers, ["situation"]),
-        games_played: findCol(headers, ["games_played","GP","gamesPlayed"]),
-        icetime: findCol(headers, ["icetime","TOI","iceTime"]),
-        ind_goals: findCol(headers, ["I_F_goals","Goals","G"]),
-        ind_points: findCol(headers, ["I_F_points","Points","P"]),
-        ind_xgoals: findCol(headers, ["I_F_xGoals","ixG","Ind_xGoals"]),
-        ind_shot_attempts: findCol(headers, ["I_F_shotAttempts","iCF","Corsi"]),
-        ind_shots_on_goal: findCol(headers, ["I_F_shotsOnGoal"]),
-        onice_goals: findCol(headers, ["OnIce_F_goals","onIce_goals"]),
-        onice_shots_on_goal: findCol(headers, ["OnIce_F_shotsOnGoal","onIce_shotsOnGoal"]),
-        onice_against_goals: findCol(headers, ["OnIce_A_goals","onIce_A_goals"]),
-        ind_hits: findCol(headers, ["I_F_hits","hits","HIT"]),
-        ind_blocks: findCol(headers, ["shotsBlockedByPlayer","blocked_shots","BLK"]),
-        ind_pim: findCol(headers, ["I_F_penalityMinutes","penalityMinutes","PIM"])
-      };
-      const idCol = findCol(headers, ["playerId","player_id","ID"]);
-      const missing = Object.entries(colmap).filter(([k,v]) => v===null && k!=="team").map(([k])=>k);
-      if (missing.length) { status.textContent = "WARNING: missing columns: " + missing.join(", "); }
-      if (!idCol) { console.warn("No playerId column found - same-name player collisions can't be disambiguated for this file."); }
-
-      // Disambiguate real same-name collisions (e.g. two current NHL players
-      // both named "Elias Pettersson") using the source playerId, since
-      // storage here has no uniqueness constraint to catch this the way the
-      // Python/SQLite version does - it would otherwise silently merge their
-      // stats under one shared name in every lookup-by-name downstream.
-      const nameToIds = {};
-      if (idCol) {
-        results.data.forEach(r => {
-          const name = r[colmap.name], id = r[idCol];
-          if (!name || id == null) return;
-          (nameToIds[name] = nameToIds[name] || new Set()).add(id);
-        });
-      }
-      const idNameCache = {}; // `${name}|${id}` -> resolved display name
-      function resolveName(rawName, id, position) {
-        if (!idCol || id == null) return rawName;
-        const ids = nameToIds[rawName];
-        if (!ids || ids.size < 2) return rawName;
-        const key = rawName + "|" + id;
-        if (idNameCache[key]) return idNameCache[key];
-        const sortedIds = [...ids].sort((a,b)=>a-b);
-        const resolved = id === sortedIds[0] ? rawName : `${rawName} (${(position||"?").toUpperCase()})`;
-        idNameCache[key] = resolved;
-        return resolved;
-      }
-
-      const rows = results.data.map(r => ({
-        season, name: resolveName(r[colmap.name], idCol ? r[idCol] : null, r[colmap.position]),
-        team: colmap.team ? r[colmap.team] : null,
-        position: r[colmap.position], situation: r[colmap.situation],
-        games_played: num(r[colmap.games_played]), icetime: num(r[colmap.icetime]),
-        ind_goals: num(r[colmap.ind_goals]), ind_points: num(r[colmap.ind_points]),
-        ind_xgoals: num(r[colmap.ind_xgoals]), ind_shot_attempts: num(r[colmap.ind_shot_attempts]),
-        ind_shots_on_goal: num(r[colmap.ind_shots_on_goal]),
-        onice_goals: num(r[colmap.onice_goals]), onice_shots_on_goal: num(r[colmap.onice_shots_on_goal]),
-        onice_against_goals: num(r[colmap.onice_against_goals]),
-        ind_hits: num(r[colmap.ind_hits]), ind_blocks: num(r[colmap.ind_blocks]), ind_pim: num(r[colmap.ind_pim])
-      })).filter(r => r.name);
-      const collisions = Object.entries(nameToIds).filter(([,ids])=>ids.size>1).map(([n])=>n);
-      if (collisions.length) toast(`Note: disambiguated ${collisions.length} same-name collision(s)`);
-
-      await dbDeleteBySeason("skaterRows", season);
-      await dbAddRows("skaterRows", rows);
-      status.textContent = `Loaded ${rows.length} rows for season ${season}.`;
-      toast(`Season ${season} loaded (${rows.length} rows)`);
+      if (dataType === "goalies") await loadGoaliesFromCSV(results, season, status);
+      else await loadSkatersFromCSV(results, season, status);
       pendingFile = null; document.getElementById("loadFile").value = "";
       document.getElementById("loadBtn").disabled = true;
+      if (typeof renderSeasonsTab === "function") renderSeasonsTab();
     }
   });
 });
 
 /* --- Seasons tab --- */
 async function renderSeasonsTab() {
-  const rows = await dbGetAll("skaterRows");
-  const bySeasson = {};
-  rows.forEach(r => {
-    bySeasson[r.season] = bySeasson[r.season] || {};
-    bySeasson[r.season][r.situation] = (bySeasson[r.season][r.situation] || 0) + 1;
+  const skaterRows = await dbGetAll("skaterRows");
+  const goalieRows = await dbGetAll("goalieRows");
+  const bySeasonType = {}; // season -> { skaters: {situation: count}, goalies: {situation: count} }
+  skaterRows.forEach(r => {
+    bySeasonType[r.season] = bySeasonType[r.season] || { skaters: {}, goalies: {} };
+    bySeasonType[r.season].skaters[r.situation] = (bySeasonType[r.season].skaters[r.situation] || 0) + 1;
   });
-  const seasons = Object.keys(bySeasson).map(Number).sort((a,b)=>a-b);
+  goalieRows.forEach(r => {
+    bySeasonType[r.season] = bySeasonType[r.season] || { skaters: {}, goalies: {} };
+    bySeasonType[r.season].goalies[r.situation] = (bySeasonType[r.season].goalies[r.situation] || 0) + 1;
+  });
+  const seasons = Object.keys(bySeasonType).map(Number).sort((a,b)=>a-b);
   const wrap = document.getElementById("seasonsTableWrap");
   if (seasons.length === 0) { wrap.innerHTML = '<p class="empty">No seasons loaded yet.</p>'; return; }
-  let html = "<table><thead><tr><th>Season</th><th>Situations loaded</th><th></th></tr></thead><tbody>";
+  const fmt = obj => Object.entries(obj).map(([sit,c])=>`${sit} (${c})`).join(", ") || "&mdash;";
+  let html = "<table><thead><tr><th>Season</th><th>Skaters loaded</th><th>Goalies loaded</th><th></th></tr></thead><tbody>";
   seasons.forEach(s => {
-    const sitStr = Object.entries(bySeasson[s]).map(([sit,c])=>`${sit} (${c})`).join(", ");
-    html += `<tr><td>${s}</td><td class="muted">${sitStr}</td><td><button class="btn danger" data-season="${s}" style="padding:4px 10px;font-size:12px">Delete</button></td></tr>`;
+    html += `<tr><td>${s}</td><td class="muted">${fmt(bySeasonType[s].skaters)}</td><td class="muted">${fmt(bySeasonType[s].goalies)}</td>` +
+      `<td><button class="btn danger" data-season="${s}" data-type="skaterRows" style="padding:4px 10px;font-size:12px" ${Object.keys(bySeasonType[s].skaters).length?"":"disabled"}>Delete skaters</button>
+       <button class="btn danger" data-season="${s}" data-type="goalieRows" style="padding:4px 10px;font-size:12px;margin-left:4px" ${Object.keys(bySeasonType[s].goalies).length?"":"disabled"}>Delete goalies</button></td></tr>`;
   });
   html += "</tbody></table>";
   wrap.innerHTML = html;
   wrap.querySelectorAll("button[data-season]").forEach(btn => {
     btn.addEventListener("click", async () => {
-      await dbDeleteBySeason("skaterRows", Number(btn.dataset.season));
-      toast(`Season ${btn.dataset.season} deleted`);
+      await dbDeleteBySeason(btn.dataset.type, Number(btn.dataset.season));
+      toast(`Season ${btn.dataset.season} ${btn.dataset.type === "goalieRows" ? "goalies" : "skaters"} deleted`);
       renderSeasonsTab();
     });
   });
@@ -1081,44 +1195,90 @@ const LEADER_BASE_COLUMNS = [
   { key:"sh_pct", label:"Sh%", decimals: 1 },
   { key:"ind_shot_attempts", label:"Shot Att" },
 ];
+const GOALIE_BASE_COLUMNS = [
+  { key:"name", label:"Name", isName:true },
+  { key:"team", label:"Team" },
+  { key:"games_played", label:"GP" },
+  { key:"games_started", label:"GS" },
+  { key:"wins", label:"W" },
+  { key:"losses", label:"L" },
+  { key:"ot_losses", label:"OT" },
+  { key:"shots_against", label:"SA" },
+  { key:"saves", label:"Svs" },
+  { key:"goals_against", label:"GA" },
+  { key:"sv_pct", label:"Sv%", decimals: 1 },
+  { key:"gaa", label:"GAA", decimals: 2 },
+  { key:"gsax", label:"GSAx", decimals: 1 },
+  { key:"hd_sv_pct", label:"HD Sv%*", decimals: 1 },
+  { key:"toi_minutes", label:"TOI" },
+  { key:"shutouts", label:"SO" },
+  { key:"off_goals", label:"G" },
+  { key:"off_assists", label:"A" },
+  { key:"off_points", label:"P" },
+  { key:"pim", label:"PIM" },
+];
 const LEADER_FANTASY_COLUMNS = [
   { key:"fantasy_pts", label:"Fantasy Pts", decimals: 1 },
   { key:"fantasy_rank", label:"Fantasy Rank" },
 ];
 function getLeaderColumns() {
-  return (fantasyConfig && fantasyConfig.enabled) ? [...LEADER_BASE_COLUMNS, ...LEADER_FANTASY_COLUMNS] : LEADER_BASE_COLUMNS;
+  const isGoalie = document.getElementById("leadersType").value === "goalies";
+  const base = isGoalie ? GOALIE_BASE_COLUMNS : LEADER_BASE_COLUMNS;
+  return (fantasyConfig && fantasyConfig.enabled) ? [...base, ...LEADER_FANTASY_COLUMNS] : base;
 }
 let leadersRawData = [];
 let leadersData = [];
 let leadersSort = { key: "ind_points", dir: -1 };
 
+document.getElementById("leadersType").addEventListener("change", () => {
+  const isGoalie = document.getElementById("leadersType").value === "goalies";
+  document.getElementById("leadersPositionWrap").style.display = isGoalie ? "none" : "";
+  leadersSort = { key: isGoalie ? "wins" : "ind_points", dir: -1 };
+  loadLeadersData();
+});
+
 async function loadLeadersData() {
   if (!fantasyConfig) await loadFantasyConfig();
-  const seasonSel = document.getElementById("leadersSeason");
-  const season = Number(seasonSel.value);
+  const isGoalie = document.getElementById("leadersType").value === "goalies";
+  const season = Number(document.getElementById("leadersSeason").value);
   const minGp = Number(document.getElementById("leadersMinGp").value) || 0;
   if (!season) { leadersRawData = []; leadersData = []; renderLeadersTable(); return; }
-  const allRows = await dbGetAll("skaterRows");
-  const on5v5Map = {}, on5v4Map = {};
-  allRows.filter(r=>r.season===season && r.situation==="5on5").forEach(r=>on5v5Map[r.name]=r);
-  allRows.filter(r=>r.season===season && r.situation==="5on4").forEach(r=>on5v4Map[r.name]=r);
 
-  leadersRawData = allRows.filter(r => r.season===season && r.situation==="all" && r.games_played>=minGp)
-    .map(r => {
-      const s5 = on5v5Map[r.name], s4 = on5v4Map[r.name];
-      const stats = {
-        goals: r.ind_goals || 0, assists: (r.ind_points||0) - (r.ind_goals||0),
-        plus_minus: s5 ? (s5.onice_goals||0) - (s5.onice_against_goals||0) : 0,
-        pim: r.ind_pim || 0, ppp: s4 ? (s4.ind_points||0) : 0,
-        sog: r.ind_shots_on_goal || 0, hits: r.ind_hits || 0, blocks: r.ind_blocks || 0,
-      };
-      const fantasy_pts = computeFantasyPoints(stats, fantasyConfig.skater);
-      return { ...r, assists: stats.assists, ppg: r.games_played ? r.ind_points/r.games_played : 0,
-                luck: r.ind_goals - r.ind_xgoals,
-                sh_pct: r.ind_shots_on_goal ? (r.ind_goals / r.ind_shots_on_goal * 100) : null,
-                plus_minus: stats.plus_minus, pim: stats.pim, ppp: stats.ppp, sog: stats.sog,
-                hits: stats.hits, blocks: stats.blocks, fantasy_pts };
-    });
+  if (isGoalie) {
+    const allRows = await dbGetAll("goalieRows");
+    leadersRawData = allRows.filter(r => r.season===season && r.situation==="all" && r.games_played>=minGp)
+      .map(r => {
+        const saves = (r.shots_against||0) - (r.goals_against||0);
+        const sv_pct = r.shots_against ? (saves / r.shots_against * 100) : null;
+        const gaa = r.icetime ? (r.goals_against * 3600 / r.icetime) : null;
+        const gsax = (r.xgoals != null) ? (r.xgoals - (r.goals_against||0)) : null;
+        const hd_sv_pct = r.hd_shots ? ((r.hd_shots - (r.hd_goals||0)) / r.hd_shots * 100) : null;
+        const stats = { wins: r.wins||0, ga: r.goals_against||0, saves, so: r.shutouts||0 };
+        const fantasy_pts = computeFantasyPoints(stats, fantasyConfig.goalie);
+        return { ...r, saves, sv_pct, gaa, gsax, hd_sv_pct, toi_minutes: r.icetime ? Math.round(r.icetime/60) : 0, fantasy_pts };
+      });
+  } else {
+    const allRows = await dbGetAll("skaterRows");
+    const on5v5Map = {}, on5v4Map = {};
+    allRows.filter(r=>r.season===season && r.situation==="5on5").forEach(r=>on5v5Map[r.name]=r);
+    allRows.filter(r=>r.season===season && r.situation==="5on4").forEach(r=>on5v4Map[r.name]=r);
+    leadersRawData = allRows.filter(r => r.season===season && r.situation==="all" && r.games_played>=minGp)
+      .map(r => {
+        const s5 = on5v5Map[r.name], s4 = on5v4Map[r.name];
+        const stats = {
+          goals: r.ind_goals || 0, assists: (r.ind_points||0) - (r.ind_goals||0),
+          plus_minus: s5 ? (s5.onice_goals||0) - (s5.onice_against_goals||0) : 0,
+          pim: r.ind_pim || 0, ppp: s4 ? (s4.ind_points||0) : 0,
+          sog: r.ind_shots_on_goal || 0, hits: r.ind_hits || 0, blocks: r.ind_blocks || 0,
+        };
+        const fantasy_pts = computeFantasyPoints(stats, fantasyConfig.skater);
+        return { ...r, assists: stats.assists, ppg: r.games_played ? r.ind_points/r.games_played : 0,
+                  luck: r.ind_goals - r.ind_xgoals,
+                  sh_pct: r.ind_shots_on_goal ? (r.ind_goals / r.ind_shots_on_goal * 100) : null,
+                  plus_minus: stats.plus_minus, pim: stats.pim, ppp: stats.ppp, sog: stats.sog,
+                  hits: stats.hits, blocks: stats.blocks, fantasy_pts };
+      });
+  }
 
   // Fantasy rank is computed on the whole min-GP-filtered season, independent
   // of the team/position filters below, so it reads as an overall rank.
@@ -1129,19 +1289,22 @@ async function loadLeadersData() {
   const teamSel = document.getElementById("leadersTeam"), posSel = document.getElementById("leadersPosition");
   const curTeam = teamSel.value, curPos = posSel.value;
   const teams = [...new Set(leadersRawData.map(r=>r.team).filter(Boolean))].sort();
-  const positions = [...new Set(leadersRawData.map(r=>r.position).filter(Boolean))].sort();
   teamSel.innerHTML = '<option value="">All Teams</option>' + teams.map(t=>`<option value="${t}">${t}</option>`).join("");
-  posSel.innerHTML = '<option value="">All Positions</option>' + positions.map(p=>`<option value="${p}">${p}</option>`).join("");
   if (teams.includes(curTeam)) teamSel.value = curTeam;
-  if (positions.includes(curPos)) posSel.value = curPos;
+  if (!isGoalie) {
+    const positions = [...new Set(leadersRawData.map(r=>r.position).filter(Boolean))].sort();
+    posSel.innerHTML = '<option value="">All Positions</option>' + positions.map(p=>`<option value="${p}">${p}</option>`).join("");
+    if (positions.includes(curPos)) posSel.value = curPos;
+  }
 
   applyLeaderFilters();
 }
 function applyLeaderFilters() {
+  const isGoalie = document.getElementById("leadersType").value === "goalies";
   const team = document.getElementById("leadersTeam").value;
   const position = document.getElementById("leadersPosition").value;
   leadersData = leadersRawData.filter(r =>
-    (!team || r.team === team) && (!position || r.position === position));
+    (!team || r.team === team) && (isGoalie || !position || r.position === position));
   renderLeadersTable();
 }
 document.getElementById("leadersTeam").addEventListener("change", applyLeaderFilters);
@@ -1210,8 +1373,9 @@ document.getElementById("playerSearch").addEventListener("input", async (e) => {
   const q = e.target.value.trim().toLowerCase();
   const resultsDiv = document.getElementById("playerResults");
   if (!q) { resultsDiv.innerHTML = ""; return; }
-  const allRows = await dbGetAll("skaterRows");
-  const names = [...new Set(allRows.map(r=>r.name))].filter(n=>n.toLowerCase().includes(q)).sort();
+  const [skaterRows, goalieRows] = await Promise.all([dbGetAll("skaterRows"), dbGetAll("goalieRows")]);
+  const names = [...new Set([...skaterRows.map(r=>r.name), ...goalieRows.map(r=>r.name)])]
+    .filter(n=>n.toLowerCase().includes(q)).sort();
   resultsDiv.innerHTML = names.slice(0, 40).map(n =>
     `<button class="playerchip" data-name="${n.replace(/"/g,"&quot;")}">${n}</button>`).join("") ||
     '<span class="muted">No matches.</span>';
@@ -1219,10 +1383,102 @@ document.getElementById("playerSearch").addEventListener("input", async (e) => {
     btn.addEventListener("click", () => showPlayerCard(btn.dataset.name));
   });
 });
+async function tryShowGoalieCard(name) {
+  const goalieRows = await dbGetAll("goalieRows");
+  const seasons = goalieRows.filter(r => r.name === name && r.situation === "all").sort((a,b)=>a.season-b.season);
+  if (seasons.length === 0) return false;
+
+  const careerGp = seasons.reduce((a,r)=>a+(r.games_played||0), 0);
+  const careerSaves = seasons.reduce((a,r)=>a+((r.shots_against||0)-(r.goals_against||0)), 0);
+  const careerShotsAgainst = seasons.reduce((a,r)=>a+(r.shots_against||0), 0);
+  const careerSvPct = careerShotsAgainst ? (careerSaves/careerShotsAgainst*100) : null;
+  const careerGsax = seasons.reduce((a,r)=>a + ((r.xgoals!=null) ? (r.xgoals-(r.goals_against||0)) : 0), 0);
+  const hasXg = seasons.some(r=>r.xgoals!=null);
+
+  let careerFantasy = 0;
+  const rowsHtml = seasons.map(r => {
+    const saves = (r.shots_against||0) - (r.goals_against||0);
+    const sv_pct = r.shots_against ? (saves/r.shots_against*100).toFixed(1) : "-";
+    const gaa = r.icetime ? (r.goals_against*3600/r.icetime).toFixed(2) : "-";
+    const gsax = r.xgoals != null ? (r.xgoals - (r.goals_against||0)).toFixed(1) : "-";
+    const toi = r.icetime ? Math.round(r.icetime/60) : 0;
+    const stats = { wins: r.wins||0, ga: r.goals_against||0, saves, so: r.shutouts||0 };
+    const fp = computeFantasyPoints(stats, fantasyConfig.goalie);
+    careerFantasy += fp;
+    const fantasyCell = fantasyConfig.enabled ? `<td>${fp.toFixed(1)}</td>` : "";
+    return `<tr><td>${r.season}</td><td>${r.team||""}</td><td>${r.games_played}</td><td>${r.games_started ?? ""}</td>` +
+      `<td>${r.wins ?? ""}</td><td>${r.losses ?? ""}</td><td>${r.ot_losses ?? ""}</td>` +
+      `<td>${r.shots_against}</td><td>${saves}</td><td>${r.goals_against}</td><td>${sv_pct}</td><td>${gaa}</td><td>${gsax}</td>` +
+      `<td>${toi}</td><td>${r.shutouts ?? ""}</td><td>${r.pim ?? ""}</td>${fantasyCell}</tr>`;
+  }).join("");
+  const fantasyHeaderCell = fantasyConfig.enabled ? "<th>Fantasy</th>" : "";
+  const fantasyStatBox = fantasyConfig.enabled
+    ? `<div class="stat-box"><div class="num">${careerFantasy.toFixed(1)}</div><div class="lbl">Career fantasy pts (loaded)</div></div>` : "";
+  const gsaxStatBox = hasXg
+    ? `<div class="stat-box"><div class="num">${careerGsax.toFixed(1)}</div><div class="lbl">Career GSAx (loaded)</div></div>` : "";
+
+  // Danger-zone breakdown, if the CSV had it (MoneyPuck's does).
+  const hasDangerData = seasons.some(r => r.hd_shots != null);
+  let dangerHtml = "";
+  if (hasDangerData) {
+    const zoneRow = (label, shotsKey, goalsKey, xgKey) => seasons.map(r => {
+      const shots = r[shotsKey], goals = r[goalsKey], xg = r[xgKey];
+      if (shots == null) return null;
+      const saves = shots - (goals||0);
+      const svPct = shots ? (saves/shots*100).toFixed(1) : "-";
+      const zGsax = xg != null ? (xg - (goals||0)).toFixed(1) : "-";
+      return { season: r.season, shots, goals, saves, svPct, zGsax };
+    }).filter(Boolean);
+    const zones = [
+      { label: "Low danger", shotsKey: "ld_shots", goalsKey: "ld_goals", xgKey: "ld_xg" },
+      { label: "Medium danger", shotsKey: "md_shots", goalsKey: "md_goals", xgKey: "md_xg" },
+      { label: "High danger", shotsKey: "hd_shots", goalsKey: "hd_goals", xgKey: "hd_xg" },
+    ];
+    const zoneTables = zones.map(z => {
+      const data = zoneRow(z.label, z.shotsKey, z.goalsKey, z.xgKey);
+      if (!data.length) return "";
+      const body = data.map(d => `<tr><td>${d.season}</td><td>${d.shots}</td><td>${d.goals}</td><td>${d.saves}</td><td>${d.svPct}</td><td>${d.zGsax}</td></tr>`).join("");
+      return `<h4 style="margin:14px 0 4px;font-size:13px;color:var(--muted)">${z.label}</h4>
+        <div class="tablewrap"><table><thead><tr><th>Season</th><th>Chances*</th><th>Goals</th><th>Saves*</th><th>Sv%*</th><th>GSAx</th></tr></thead>
+        <tbody>${body}</tbody></table></div>`;
+    }).join("");
+    dangerHtml = `<h3 style="margin-top:18px">Danger-zone breakdown</h3>
+      <p class="muted">*Chances/Saves/Sv% here are based on unblocked shot attempts (on-goal + missed), not shots-on-goal only - won't exactly match Sv% calculators that use SOG. GSAx (xGoals &minus; goals) is unaffected by that and is the more reliable "did they outperform expectation in this zone" number.</p>
+      ${zoneTables}`;
+  }
+
+  document.getElementById("playerCard").innerHTML = `
+    <div class="card">
+      <div class="playercard-head"><h3>${name}</h3><span class="pill">G</span></div>
+      <div class="stat-grid">
+        <div class="stat-box"><div class="num">${seasons.length}</div><div class="lbl">Seasons loaded</div></div>
+        <div class="stat-box"><div class="num">${careerGp}</div><div class="lbl">Career GP (loaded)</div></div>
+        <div class="stat-box"><div class="num">${careerSvPct!=null?careerSvPct.toFixed(1)+"%":"&mdash;"}</div><div class="lbl">Career Sv% (loaded)</div></div>
+        ${gsaxStatBox}
+        ${fantasyStatBox}
+      </div>
+      <p class="muted">W/L/OT/SO/GS aren't in MoneyPuck's goalie export - these show blank until you have a source for them.</p>
+      <div class="tablewrap">
+        <table><thead><tr><th>Season</th><th>Team</th><th>GP</th><th>GS</th><th>W</th><th>L</th><th>OT</th>
+          <th>SA</th><th>Svs</th><th>GA</th><th>Sv%</th><th>GAA</th><th>GSAx</th><th>TOI</th><th>SO</th><th>PIM</th>${fantasyHeaderCell}</tr></thead>
+        <tbody>${rowsHtml}</tbody></table>
+      </div>
+      ${dangerHtml}
+      <p class="muted" style="margin-top:12px">No career trajectory chart or breakout score for goalies yet - both are built around skater NHLe/scoring rates.</p>
+    </div>`;
+  return true;
+}
+
 async function showPlayerCard(name) {
   if (!fantasyConfig) await loadFantasyConfig();
   const allRows = await dbGetAll("skaterRows");
   const seasons = allRows.filter(r => r.name === name && r.situation === "all").sort((a,b)=>a.season-b.season);
+
+  if (seasons.length === 0) {
+    const goalieCard = await tryShowGoalieCard(name);
+    if (goalieCard) return;
+  }
+
   const positions = [...new Set(seasons.map(r=>r.position))].join("/");
   const careerGp = seasons.reduce((a,r)=>a+(r.games_played||0), 0);
   const careerPts = seasons.reduce((a,r)=>a+(r.ind_points||0), 0);
